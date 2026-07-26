@@ -15,7 +15,6 @@ from app.core.blockchain import Blockchain
 from app.core.transaction import create_transfer
 from app.core.wallet import generate_wallet
 from app.storage.sqlite_store import SQLiteStore
-
 from tests.test_core import mine_block
 
 

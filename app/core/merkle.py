@@ -11,7 +11,7 @@ def _combine(left: str, right: str) -> str:
     try:
         payload = bytes.fromhex(left) + bytes.fromhex(right)
     except ValueError:
-        payload = f"{left}{right}".encode("utf-8")
+        payload = f"{left}{right}".encode()
     return sha256_hex(payload)
 
 

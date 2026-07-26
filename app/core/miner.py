@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from app.core.block import compute_block_hash, hash_meets_difficulty, hash_meets_target
 from app.core.blockchain import Blockchain

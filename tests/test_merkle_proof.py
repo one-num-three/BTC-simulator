@@ -110,7 +110,7 @@ def test_root_is_unchanged_by_the_refactor():
                 try:
                     payload = bytes.fromhex(left) + bytes.fromhex(right)
                 except ValueError:
-                    payload = f"{left}{right}".encode("utf-8")
+                    payload = f"{left}{right}".encode()
                 nxt.append(sha256_hex(payload))
             layer = nxt
         return layer[0]

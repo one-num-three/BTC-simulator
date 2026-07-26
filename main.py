@@ -10,8 +10,8 @@ from app.config import (
     is_default_node_name,
     load_config,
     random_node_name,
-    save_config,
     sanitize_node_name,
+    save_config,
 )
 from app.runtime import NodeService
 from app.web.api import create_web_app
@@ -40,6 +40,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def announce(config: dict, service: NodeService) -> None:
+    """Print the console URL and the admin token once, at startup.
+
+    The token is what lets a teacher drive this node from another machine.
+    It is stored next to the database and deliberately never written into the
+    config file, which is tracked by git.
+    """
+    host = config["web_host"]
+    display = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    print()
+    print(f"  BTC Simulator {config['version']}  node: {config['node_name']}")
+    print(f"  console:     http://{display}:{int(config['web_port'])}")
+    print(f"  admin token: {service.admin_token}")
+    print("  (reads are open on the LAN; writes need this token, or the node's own machine)")
+    print(f"  remote admin: http://<this machine>:{int(config['web_port'])}/?token={service.admin_token}")
+    print()
+
+
 def main() -> None:
     ensure_stdio()
     args = parse_args()
@@ -52,6 +70,7 @@ def main() -> None:
         save_config(config)
     service = NodeService(config)
     app = create_web_app(service)
+    announce(config, service)
     uvicorn.run(
         app,
         host=config["web_host"],

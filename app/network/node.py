@@ -4,18 +4,19 @@ import asyncio
 import socket
 import time
 from asyncio import Server, StreamReader, StreamWriter
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from app.config import network_identity
+from app.core.block import compute_block_hash, format_work, parse_work
+from app.core.blockchain import DISCONNECTED_BLOCK_REASON
 from app.network.address import (
     configured_listen_hosts,
     format_host_port,
     is_loopback_or_unspecified,
     normalize_host,
 )
-from app.core.block import compute_block_hash, format_work, parse_work
-from app.core.blockchain import DISCONNECTED_BLOCK_REASON
 from app.network.protocol import block_message_id, read_json, send_json, tx_message_id
 from app.status import PeerStatus
 from app.utils.collections import BoundedSet
@@ -94,6 +95,48 @@ class P2PNode:
             "target": self.service.blockchain.expected_target(),
             "mining_status": self.service.miner.status,
         }
+
+    def _chain_status(self) -> dict[str, Any]:
+        """Our current tip, small enough to piggyback on every heartbeat.
+
+        HELLO carries this too, but only once. Without refreshing it a peer's
+        advertised height and work stay frozen at whatever they were when the
+        connection opened, so the periodic sync never notices anybody has moved
+        ahead and a node that missed a broadcast stays behind indefinitely.
+        """
+        return {
+            "timestamp": int(time.time()),
+            "height": self.service.blockchain.height(),
+            "chain_work": format_work(self.service.blockchain.chain_work()),
+            "tip_hash": self.service.blockchain.tip_hash(),
+            "difficulty": self.service.blockchain.expected_difficulty(),
+            "target": self.service.blockchain.expected_target(),
+            "mining_status": self.service.miner.status,
+        }
+
+    def _absorb_chain_status(self, conn: PeerConnection, message: dict[str, Any]) -> None:
+        if "height" in message:
+            try:
+                conn.height = int(message.get("height") or 0)
+            except (TypeError, ValueError):
+                pass
+        if message.get("chain_work"):
+            conn.chain_work = str(message["chain_work"])
+        if message.get("tip_hash"):
+            conn.tip_hash = str(message["tip_hash"])
+        if message.get("mining_status"):
+            conn.mining_status = str(message["mining_status"])
+        if message.get("target"):
+            conn.target = str(message["target"])
+        if "difficulty" in message:
+            try:
+                conn.difficulty = int(message.get("difficulty") or 0)
+            except (TypeError, ValueError):
+                pass
+
+    async def _maybe_pull_from(self, conn: PeerConnection) -> None:
+        if self._peer_chain_is_better(conn):
+            await self._request_chain_from(conn)
 
     def _peer_fields(self, conn: PeerConnection) -> dict[str, Any]:
         return {
@@ -343,8 +386,11 @@ class P2PNode:
         elif msg_type == "BLOCKS":
             await self._handle_blocks(conn, message)
         elif msg_type == "PING":
-            await send_json(conn.writer, {"type": "PONG", "timestamp": int(time.time())})
+            self._absorb_chain_status(conn, message)
+            await send_json(conn.writer, {"type": "PONG", **self._chain_status()})
+            await self._maybe_pull_from(conn)
         elif msg_type == "PONG":
+            self._absorb_chain_status(conn, message)
             self.service.store.upsert_peer(
                 conn.ip,
                 int(conn.listen_port or conn.port),
@@ -355,6 +401,7 @@ class P2PNode:
                 int(time.time()),
                 **self._peer_fields(conn),
             )
+            await self._maybe_pull_from(conn)
 
     async def _handle_hello(self, conn: PeerConnection, message: dict[str, Any]) -> None:
         conn.name = message.get("node_name")
@@ -655,9 +702,11 @@ class P2PNode:
         return count
 
     async def ping_peers(self) -> None:
+        """Heartbeat that doubles as a tip announcement."""
+        status = {"type": "PING", **self._chain_status()}
         for conn in list(self.connections.values()):
             try:
-                await send_json(conn.writer, {"type": "PING", "timestamp": int(time.time())})
+                await send_json(conn.writer, status)
             except Exception:
                 continue
 

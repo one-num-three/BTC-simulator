@@ -26,8 +26,7 @@ from app.core.blockchain import DISCONNECTED_BLOCK_REASON, MAX_ORPHAN_BLOCKS, Bl
 from app.core.wallet import generate_wallet
 from app.storage.sqlite_store import SQLiteStore
 from app.utils.collections import BoundedSet
-
-from tests.test_core import make_stack, mine_block
+from tests.test_core import mine_block
 
 
 def make_chain(tmp_path: Path, name: str = "chain", **overrides):

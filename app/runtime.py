@@ -33,7 +33,6 @@ from app.network.node import P2PNode
 from app.status import PeerStatus
 from app.storage.sqlite_store import SQLiteStore
 
-
 DEFAULT_LAB_TASKS: list[dict[str, Any]] = [
     {
         "id": "wallet",

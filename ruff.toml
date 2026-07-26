@@ -1,0 +1,15 @@
+line-length = 100
+target-version = "py310"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = [
+  "E501",   # long lines are mostly explanatory comments
+  "B008",   # FastAPI's Depends() in defaults is the documented pattern
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["B011"]
+# init_node.py adjusts sys.path before importing the app package so it can be
+# run straight from a checkout without installing anything.
+"scripts/init_node.py" = ["E402"]

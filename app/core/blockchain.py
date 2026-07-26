@@ -3,11 +3,11 @@ from __future__ import annotations
 import math
 import time
 from collections import OrderedDict
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from app.core.block import (
     MEDIAN_TIME_SPAN,
-    block_work,
     compute_block_hash,
     create_block,
     difficulty_to_target,
@@ -700,10 +700,23 @@ class Blockchain:
         return True, validated_hash
 
     def select_transactions_for_block(self, max_transfers: int) -> list[dict[str, Any]]:
+        """Pick transactions for the next block, highest fee rate first.
+
+        The store orders by raw fee; a miner cares about fee per byte, since
+        block space is the scarce thing.
+        """
         selected: list[dict[str, Any]] = []
         temp_balances: dict[str, float] = {}
 
-        for tx in self.store.list_mempool_transactions():
+        candidates = self.store.list_mempool_transactions()
+        candidates.sort(
+            key=lambda tx: (
+                float(tx.get("fee", 0.0)) / max(len(str(tx)), 1),
+                -int(tx.get("timestamp", 0)),
+            ),
+            reverse=True,
+        )
+        for tx in candidates:
             if len(selected) >= max_transfers:
                 break
             try:

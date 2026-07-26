@@ -440,7 +440,7 @@ class SQLiteStore:
             self.conn.execute("DELETE FROM blocks")
             self.conn.execute("DELETE FROM transactions")
             self.conn.execute("DELETE FROM mempool")
-            for height, (block, block_hash) in enumerate(zip(blocks, block_hashes)):
+            for height, (block, block_hash) in enumerate(zip(blocks, block_hashes, strict=True)):
                 self.insert_block(height, block_hash, block)
 
     def is_tx_confirmed(self, tx_id: str) -> bool:
@@ -723,6 +723,13 @@ class SQLiteStore:
             "count": len(txs),
             "bytes": sum(estimate_transaction_bytes(tx) for tx in txs),
         }
+
+    def expired_mempool_tx_ids(self, cutoff: int) -> list[str]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT tx_id FROM mempool WHERE received_at < ?", (int(cutoff),)
+            ).fetchall()
+        return [str(row["tx_id"]) for row in rows]
 
     def remove_mempool_transactions(self, tx_ids: list[str]) -> None:
         if not tx_ids:
