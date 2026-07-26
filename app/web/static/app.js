@@ -41,6 +41,7 @@
     socket: null,
     reconnectDelay: 1000,
     classroomTimer: null,
+    lastOrphanCount: 0,
   };
 
   const BLOCKS_LIMIT = 30;
@@ -474,6 +475,10 @@
 
     renderJoinInfo(status);
     renderAddressQr(status);
+    if (Number(status.orphan_count || 0) !== state.lastOrphanCount) {
+      state.lastOrphanCount = Number(status.orphan_count || 0);
+      refreshTips().catch(() => {});
+    }
     renderLogs(status.logs || []);
     renderSecurityEvents((status.security && status.security.events) || []);
   }
@@ -976,6 +981,83 @@
   }
 
   /**
+   * Show the block as a genuine 80-byte Bitcoin header.
+   *
+   * The simulator hashes canonical JSON so the header stays readable, which
+   * means students never see what a real header actually looks like — the
+   * reversed hash byte order and the nBits compact target in particular.
+   */
+  async function showHeaderBytes() {
+    const block = state.currentBlock;
+    if (!block) {
+      showToast("请先选择一个区块");
+      return;
+    }
+    try {
+      const described = await api(`/api/blocks/${encodeURIComponent(block.height)}/header`);
+      const box = $("#headerBox");
+      const body = $("#headerFields");
+      if (!box || !body) return;
+      box.hidden = false;
+      setText("#headerNote", described.note);
+      setCopyable("#headerHex", described.hex);
+      body.replaceChildren();
+      for (const field of described.fields || []) {
+        const row = el("tr");
+        row.appendChild(textCell(field.name, "mono"));
+        row.appendChild(textCell(field.bytes));
+        row.appendChild(textCell(field.hex, "mono"));
+        row.appendChild(textCell(field.value, "mono"));
+        row.appendChild(textCell(field.note));
+        body.appendChild(row);
+      }
+      const summary = el("tr", { className: "pending-row" });
+      summary.appendChild(textCell("nBits 解出的目标", "mono"));
+      summary.appendChild(textCell("--"));
+      summary.appendChild(textCell(described.nbits_hex, "mono"));
+      summary.appendChild(textCell(shortHash(described.nbits_target, 12), "mono"));
+      summary.appendChild(
+        textCell("压缩编码是有损的，解出来的目标略小于模拟器用的目标"),
+      );
+      body.appendChild(summary);
+    } catch (error) {
+      report(error);
+    }
+  }
+
+  /** Competing tips: the only way a fork is ever visible in the console. */
+  async function refreshTips() {
+    const banner = $("#forkBanner");
+    if (!banner) return;
+    try {
+      const data = await api("/api/tips");
+      if (!data.forked) {
+        banner.hidden = true;
+        return;
+      }
+      banner.hidden = false;
+      const orphans = (data.tips || []).filter((tip) => tip.kind === "orphan");
+      replaceChildren(banner, [
+        el("strong", { text: `检测到 ${orphans.length} 个竞争区块（分叉）` }),
+        el("p", {
+          text:
+            "这些区块没能接上当前链头，通常是有人和你同时挖到了同一高度。" +
+            "节点已经向对方要了整条链，累计工作量更大的那一条会赢。",
+        }),
+        ...orphans.map((tip) =>
+          el("div", { className: "fork-tip mono" }, [
+            el("span", { text: `高度 ${tip.height ?? "?"} ` }),
+            el("span", { text: shortHash(tip.hash, 10), title: tip.hash }),
+            el("span", { text: ` ← ${shortHash(tip.prev_hash, 8)}` }),
+          ]),
+        ),
+      ]);
+    } catch (_error) {
+      banner.hidden = true;
+    }
+  }
+
+  /**
    * Show the Merkle path for one transaction.
    * This is SPV made visible: a handful of hashes stands in for the whole
    * block body.
@@ -1402,7 +1484,7 @@
 
   const TAB_LOADERS = {
     nodes: () => refreshPeers(),
-    explorer: () => refreshBlocks(),
+    explorer: () => Promise.all([refreshBlocks(), refreshTips()]),
     history: () => refreshHistory(),
     charts: () => refreshCharts(),
     receive: () => refreshWallets(),
@@ -1606,6 +1688,11 @@
       if (event.key === "Enter") runSearch().catch(report);
     });
     on("#closeProofBtn", "click", hideProof);
+    on("#showHeaderBtn", "click", () => showHeaderBytes());
+    on("#closeHeaderBtn", "click", () => {
+      const box = $("#headerBox");
+      if (box) box.hidden = true;
+    });
 
     on("#prevHistoryBtn", "click", () => {
       state.historyOffset = Math.max(0, state.historyOffset - state.historyLimit);

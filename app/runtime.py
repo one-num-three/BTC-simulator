@@ -16,6 +16,7 @@ from app.config import (
 )
 from app.core.block import target_preview
 from app.core.blockchain import Blockchain
+from app.core.btc_format import describe_header
 from app.core.mempool import Mempool
 from app.core.merkle import merkle_proof, proof_steps, verify_merkle_proof
 from app.core.miner import Miner
@@ -421,6 +422,65 @@ class NodeService:
             "verified": verify_merkle_proof(tx_id, proof, root),
             "hashes_needed": len(proof),
             "hashes_avoided": max(len(tx_ids) - len(proof), 0),
+        }
+
+    def block_header_bytes(self, identifier: str) -> dict[str, Any] | None:
+        """The same block rendered as a real 80-byte Bitcoin header.
+
+        Teaching only: the simulator's own block hash is the double-SHA256 of
+        canonical JSON, which keeps the header readable. This lets a student
+        see what the bytes would actually look like, including the reversed
+        hash byte order and the nBits compact target.
+        """
+        row = self.store.get_block_detail(identifier)
+        if row is None:
+            return None
+        block = json.loads(row["block_json"]) if isinstance(row.get("block_json"), str) else row.get("block")
+        header = (block or {}).get("header") or {}
+        described = describe_header(header)
+        described["height"] = row.get("height")
+        described["simulator_hash"] = row.get("hash")
+        return described
+
+    def chain_tips(self) -> dict[str, Any]:
+        """The active tip plus any competing tips we are holding.
+
+        Orphans are blocks that did not connect: usually the other side of a
+        mining race. Showing them is the only way a student ever sees a fork
+        happen, which is otherwise invisible in a chain that only ever displays
+        the winner.
+        """
+        tip = self.blockchain.tip()
+        tips = [
+            {
+                "kind": "active",
+                "hash": tip["hash"],
+                "prev_hash": tip["prev_hash"],
+                "height": int(tip["height"]),
+                "timestamp": int(tip["timestamp"]),
+                "difficulty": int(tip["difficulty"]),
+                "work": str(self.blockchain.chain_work()),
+            }
+        ]
+        for block_hash, block in self.blockchain.orphans.items():
+            header = block.get("header", {})
+            parent = self.store.get_block_by_hash(str(header.get("prev_hash", "")))
+            tips.append(
+                {
+                    "kind": "orphan",
+                    "hash": block_hash,
+                    "prev_hash": header.get("prev_hash"),
+                    "height": (int(parent["height"]) + 1) if parent else None,
+                    "timestamp": int(header.get("timestamp", 0)),
+                    "difficulty": int(header.get("difficulty", 0)),
+                    "parent_known": parent is not None,
+                }
+            )
+        return {
+            "tips": tips,
+            "active": tip["hash"],
+            "orphan_count": len(self.blockchain.orphans),
+            "forked": len(self.blockchain.orphans) > 0,
         }
 
     def search(self, query: str) -> dict[str, Any]:

@@ -273,3 +273,62 @@ def test_websocket_streams_status(node):
         assert frame["full"] is True
         assert "height" in frame
         assert "wallet" in frame
+
+
+# --------------------------------------------------------------------------
+# real Bitcoin header view and fork tips
+# --------------------------------------------------------------------------
+
+
+def test_header_endpoint_returns_eighty_bytes(node):
+    service, client, headers = node
+    assert mine_one(service, client, headers) >= 1
+    height = service.blockchain.height()
+
+    described = client.get(f"/api/blocks/{height}/header")
+    assert described.status_code == 200
+    body = described.json()
+    assert body["size"] == 80
+    assert len(body["hex"]) == 160
+    assert body["height"] == height
+    # the teaching view must not be mistaken for the consensus hash
+    assert body["bitcoin_style_hash"] != body["simulator_hash"]
+    assert client.get("/api/blocks/99999/header").status_code == 404
+
+
+def test_tips_endpoint_reports_no_fork_on_a_clean_chain(node):
+    service, client, headers = node
+    assert mine_one(service, client, headers) >= 1
+    body = client.get("/api/tips").json()
+    assert body["forked"] is False
+    assert body["orphan_count"] == 0
+    assert len(body["tips"]) == 1
+    assert body["tips"][0]["kind"] == "active"
+    assert body["active"] == service.blockchain.tip_hash()
+
+
+def test_tips_endpoint_surfaces_a_competing_block(node):
+    """A fork is otherwise invisible: the console only ever shows the winner."""
+    service, client, headers = node
+    assert mine_one(service, client, headers) >= 1
+
+    from app.core.block import compute_block_hash
+    from app.core.wallet import generate_wallet
+
+    # build a rival block on the same parent as the current tip
+    tip = service.blockchain.tip()
+    parent = service.store.get_block_by_height(int(tip["height"]) - 1)
+    rival = json.loads(tip["block_json"])
+    rival["header"]["nonce"] = int(rival["header"]["nonce"]) + 1
+    rival["header"]["prev_hash"] = parent["hash"]
+    service.blockchain.remember_orphan(rival)
+
+    body = client.get("/api/tips").json()
+    assert body["forked"] is True
+    assert body["orphan_count"] == 1
+    kinds = {tip_entry["kind"] for tip_entry in body["tips"]}
+    assert kinds == {"active", "orphan"}
+    orphan = next(t for t in body["tips"] if t["kind"] == "orphan")
+    assert orphan["parent_known"] is True
+    assert orphan["hash"] == compute_block_hash(rival)
+    assert generate_wallet  # keep the import meaningful for future cases

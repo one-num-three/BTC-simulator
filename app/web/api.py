@@ -163,6 +163,17 @@ def create_web_app(service: NodeService) -> FastAPI:
             raise HTTPException(status_code=404, detail="transaction not found in any block")
         return proof
 
+    @app.get("/api/blocks/{identifier}/header")
+    async def block_header(identifier: str) -> dict[str, Any]:
+        described = service.block_header_bytes(identifier)
+        if described is None:
+            raise HTTPException(status_code=404, detail="block not found")
+        return described
+
+    @app.get("/api/tips")
+    async def tips() -> dict[str, Any]:
+        return service.chain_tips()
+
     @app.get("/api/stats")
     async def stats(window: int = 100) -> dict[str, Any]:
         return service.chart_stats(window=window)

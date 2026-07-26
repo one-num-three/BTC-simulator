@@ -398,6 +398,7 @@
               <button class="ghost-btn" id="blockSearchBtn" type="button">查询</button>
             </div>
             <div class="search-result" id="searchResult" hidden></div>
+            <div class="fork-banner" id="forkBanner" hidden></div>
             <div class="table-wrap block-table-wrap">
               <table>
                 <caption class="sr-only">区块列表</caption>
@@ -419,7 +420,10 @@
           <section class="panel">
             <div class="panel-head">
               <h2>区块详情</h2>
-              <span class="detail-chip" id="blockDetailTitle">未选择</span>
+              <div class="button-row">
+                <button class="ghost-btn" id="showHeaderBtn" type="button">看 80 字节区块头</button>
+                <span class="detail-chip" id="blockDetailTitle">未选择</span>
+              </div>
             </div>
             <div class="block-detail-grid">
               <div class="detail-cell span-2">
@@ -469,6 +473,30 @@
                 <tbody id="blockTxTable"></tbody>
               </table>
             </div>
+            <div class="proof-box" id="headerBox" hidden>
+              <div class="panel-head">
+                <h3>真实比特币区块头（80 字节）</h3>
+                <button class="ghost-btn" id="closeHeaderBtn" type="button">关闭</button>
+              </div>
+              <p class="form-hint" id="headerNote">--</p>
+              <output class="mono hash-output copyable" id="headerHex" data-copy="" tabindex="0">--</output>
+              <div class="table-wrap">
+                <table>
+                  <caption class="sr-only">区块头逐字段拆解</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">字段</th>
+                      <th scope="col">字节</th>
+                      <th scope="col">十六进制</th>
+                      <th scope="col">值</th>
+                      <th scope="col">说明</th>
+                    </tr>
+                  </thead>
+                  <tbody id="headerFields"></tbody>
+                </table>
+              </div>
+            </div>
+
             <div class="proof-box" id="proofBox" hidden>
               <div class="panel-head">
                 <h3>Merkle 包含性证明</h3>
