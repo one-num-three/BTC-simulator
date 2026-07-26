@@ -4,21 +4,26 @@ import asyncio
 import socket
 import time
 from asyncio import Server, StreamReader, StreamWriter
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from app.config import network_identity
+from app.core.block import compute_block_hash, format_work, parse_work
+from app.core.blockchain import DISCONNECTED_BLOCK_REASON
 from app.network.address import (
     configured_listen_hosts,
     format_host_port,
     is_loopback_or_unspecified,
     normalize_host,
 )
-from app.core.block import compute_block_hash
 from app.network.protocol import block_message_id, read_json, send_json, tx_message_id
+from app.status import PeerStatus
+from app.utils.collections import BoundedSet
 
 LogFn = Callable[[str], None]
 STREAM_LIMIT_BYTES = 64 * 1024 * 1024
+SEEN_MESSAGE_CACHE = 20000
 
 
 @dataclass
@@ -34,12 +39,14 @@ class PeerConnection:
     network_id: str | None = None
     chain_params_hash: str | None = None
     height: int | None = None
+    chain_work: str | None = None
+    tip_hash: str | None = None
     difficulty: int | None = None
     target: str | None = None
     mining_status: str | None = None
     web_port: int | None = None
     mismatch_reason: str | None = None
-    final_status: str = "offline"
+    final_status: str = PeerStatus.OFFLINE
 
     @property
     def key(self) -> str:
@@ -54,9 +61,13 @@ class P2PNode:
         self.servers: list[Server] = []
         self.listen_hosts = configured_listen_hosts(config)
         self.connections: dict[str, PeerConnection] = {}
-        self.seen_message_ids: set[str] = set()
+        self.seen_message_ids = BoundedSet(SEEN_MESSAGE_CACHE)
         self._tasks: set[asyncio.Task[Any]] = set()
         self.identity = network_identity(config)
+
+    @property
+    def connect_timeout_seconds(self) -> float:
+        return max(float(self.config.get("peer_connect_timeout_seconds", 5)), 0.5)
 
     def _is_self(self, ip: str, port: int) -> bool:
         own_port = int(self.config["listen_port"])
@@ -78,16 +89,62 @@ class P2PNode:
             "listen_port": int(self.config["listen_port"]),
             "web_port": int(self.config["web_port"]),
             "height": self.service.blockchain.height(),
+            "chain_work": format_work(self.service.blockchain.chain_work()),
+            "tip_hash": self.service.blockchain.tip_hash(),
             "difficulty": self.service.blockchain.expected_difficulty(),
             "target": self.service.blockchain.expected_target(),
             "mining_status": self.service.miner.status,
         }
+
+    def _chain_status(self) -> dict[str, Any]:
+        """Our current tip, small enough to piggyback on every heartbeat.
+
+        HELLO carries this too, but only once. Without refreshing it a peer's
+        advertised height and work stay frozen at whatever they were when the
+        connection opened, so the periodic sync never notices anybody has moved
+        ahead and a node that missed a broadcast stays behind indefinitely.
+        """
+        return {
+            "timestamp": int(time.time()),
+            "height": self.service.blockchain.height(),
+            "chain_work": format_work(self.service.blockchain.chain_work()),
+            "tip_hash": self.service.blockchain.tip_hash(),
+            "difficulty": self.service.blockchain.expected_difficulty(),
+            "target": self.service.blockchain.expected_target(),
+            "mining_status": self.service.miner.status,
+        }
+
+    def _absorb_chain_status(self, conn: PeerConnection, message: dict[str, Any]) -> None:
+        if "height" in message:
+            try:
+                conn.height = int(message.get("height") or 0)
+            except (TypeError, ValueError):
+                pass
+        if message.get("chain_work"):
+            conn.chain_work = str(message["chain_work"])
+        if message.get("tip_hash"):
+            conn.tip_hash = str(message["tip_hash"])
+        if message.get("mining_status"):
+            conn.mining_status = str(message["mining_status"])
+        if message.get("target"):
+            conn.target = str(message["target"])
+        if "difficulty" in message:
+            try:
+                conn.difficulty = int(message.get("difficulty") or 0)
+            except (TypeError, ValueError):
+                pass
+
+    async def _maybe_pull_from(self, conn: PeerConnection) -> None:
+        if self._peer_chain_is_better(conn):
+            await self._request_chain_from(conn)
 
     def _peer_fields(self, conn: PeerConnection) -> dict[str, Any]:
         return {
             "network_id": conn.network_id,
             "chain_params_hash": conn.chain_params_hash,
             "height": conn.height,
+            "chain_work": conn.chain_work,
+            "tip_hash": conn.tip_hash,
             "difficulty": conn.difficulty,
             "target": conn.target,
             "mining_status": conn.mining_status,
@@ -185,19 +242,55 @@ class P2PNode:
             if not self._is_self(str(host), int(port)):
                 await self.connect_peer(str(host), int(port))
 
+    async def disconnect_peer(self, ip: str, port: int) -> bool:
+        """Drop a live connection, by listen address or by socket address."""
+        host = normalize_host(ip)
+        dropped = False
+        for key, conn in list(self.connections.items()):
+            matches = conn.ip == host and int(port) in {
+                int(conn.port),
+                int(conn.listen_port or conn.port),
+            }
+            if not matches:
+                continue
+            self.connections.pop(key, None)
+            conn.writer.close()
+            dropped = True
+        return dropped
+
     async def connect_peer(self, ip: str, port: int) -> tuple[bool, str]:
         ip = normalize_host(ip)
         if self._is_self(ip, port):
             return False, "ignored self peer"
+        if self.service.store.is_peer_banned(ip, int(port)):
+            return False, "peer is banned on this node"
         key = format_host_port(ip, port)
         if key in self.connections:
             return False, "peer already connected"
         try:
-            reader, writer = await asyncio.open_connection(
+            # Without a deadline a mistyped LAN address parks the request until
+            # the OS gives up on the SYN -- around two minutes on Linux -- and
+            # the browser's "connect node" button just spins the whole time.
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, int(port), limit=STREAM_LIMIT_BYTES),
+                timeout=self.connect_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            message = (
+                f"no response from {format_host_port(ip, int(port))} within "
+                f"{self.connect_timeout_seconds}s"
+            )
+            self.service.store.upsert_peer(
                 ip,
                 int(port),
-                limit=STREAM_LIMIT_BYTES,
+                None,
+                None,
+                "outbound",
+                PeerStatus.OFFLINE,
+                int(time.time()),
+                mismatch_reason=message,
             )
+            return False, message
         except OSError as exc:
             self.service.store.upsert_peer(
                 ip,
@@ -205,7 +298,7 @@ class P2PNode:
                 None,
                 None,
                 "outbound",
-                "offline",
+                PeerStatus.OFFLINE,
                 int(time.time()),
                 mismatch_reason=str(exc),
             )
@@ -218,7 +311,19 @@ class P2PNode:
         peer_info = writer.get_extra_info("peername")
         ip = normalize_host(peer_info[0]) if peer_info else "unknown"
         port = int(peer_info[1]) if peer_info else 0
+        if self._is_banned_host(ip):
+            self.log(f"Refused inbound connection from banned host {ip}")
+            writer.close()
+            return
         await self._connection_loop(reader, writer, ip, port, "inbound")
+
+    def _is_banned_host(self, ip: str) -> bool:
+        """Inbound sockets use an ephemeral port, so ban by host address."""
+        host = normalize_host(ip)
+        return any(
+            normalize_host(str(entry["ip"])) == host
+            for entry in self.service.store.list_banned_peers()
+        )
 
     async def _connection_loop(
         self,
@@ -233,7 +338,7 @@ class P2PNode:
         temp_key = format_host_port(ip, port)
         self.connections[temp_key] = conn
         if direction == "outbound":
-            self.service.store.upsert_peer(ip, port, None, None, direction, "connected", int(time.time()))
+            self.service.store.upsert_peer(ip, port, None, None, direction, PeerStatus.CONNECTED, int(time.time()))
         try:
             await send_json(writer, self._hello())
             while True:
@@ -281,18 +386,22 @@ class P2PNode:
         elif msg_type == "BLOCKS":
             await self._handle_blocks(conn, message)
         elif msg_type == "PING":
-            await send_json(conn.writer, {"type": "PONG", "timestamp": int(time.time())})
+            self._absorb_chain_status(conn, message)
+            await send_json(conn.writer, {"type": "PONG", **self._chain_status()})
+            await self._maybe_pull_from(conn)
         elif msg_type == "PONG":
+            self._absorb_chain_status(conn, message)
             self.service.store.upsert_peer(
                 conn.ip,
                 int(conn.listen_port or conn.port),
                 conn.name,
                 conn.address,
                 conn.direction,
-                "connected",
+                PeerStatus.CONNECTED,
                 int(time.time()),
                 **self._peer_fields(conn),
             )
+            await self._maybe_pull_from(conn)
 
     async def _handle_hello(self, conn: PeerConnection, message: dict[str, Any]) -> None:
         conn.name = message.get("node_name")
@@ -301,6 +410,8 @@ class P2PNode:
         conn.network_id = str(message.get("network_id") or "")
         conn.chain_params_hash = str(message.get("chain_params_hash") or "")
         conn.height = int(message.get("height") or 0)
+        conn.chain_work = str(message.get("chain_work") or "") or None
+        conn.tip_hash = str(message.get("tip_hash") or "") or None
         conn.difficulty = int(message.get("difficulty") or 0)
         conn.target = str(message.get("target") or "") or None
         conn.mining_status = str(message.get("mining_status") or "")
@@ -308,7 +419,7 @@ class P2PNode:
         identity_conflict = self._identity_conflict_reason(conn)
         if identity_conflict:
             conn.mismatch_reason = identity_conflict
-            conn.final_status = "self connection"
+            conn.final_status = PeerStatus.SELF_CONNECTION
             self.log(f"Ignored peer {conn.name or conn.key}: {identity_conflict}")
             conn.writer.close()
             return
@@ -320,7 +431,7 @@ class P2PNode:
         existing = self.connections.get(conn.key)
         if existing is not None and existing is not conn:
             conn.mismatch_reason = "peer address already connected"
-            conn.final_status = "duplicate peer address"
+            conn.final_status = PeerStatus.DUPLICATE_ADDRESS
             self.log(f"Ignored peer {conn.name or conn.key}: {conn.mismatch_reason}")
             conn.writer.close()
             return
@@ -328,7 +439,7 @@ class P2PNode:
         mismatch = self._network_mismatch_reason(conn)
         if mismatch:
             conn.mismatch_reason = mismatch
-            conn.final_status = "参数不匹配"
+            conn.final_status = PeerStatus.PARAM_MISMATCH
             self.service.store.upsert_peer(
                 conn.ip,
                 int(conn.listen_port),
@@ -343,22 +454,34 @@ class P2PNode:
             conn.writer.close()
             return
 
-        conn.final_status = "offline"
+        conn.final_status = PeerStatus.OFFLINE
         self.service.store.upsert_peer(
             conn.ip,
             int(conn.listen_port),
             conn.name,
             conn.address,
             conn.direction,
-            "connected",
+            PeerStatus.CONNECTED,
             int(time.time()),
             **self._peer_fields(conn),
         )
         self.log(f"Connected peer {conn.name or conn.key} at {format_host_port(conn.ip, conn.listen_port)}")
         await send_json(conn.writer, {"type": "PEERS", "peers": self.known_peers()})
-        remote_height = int(message.get("height") or 0)
-        if remote_height > self.service.blockchain.height():
-            await send_json(conn.writer, {"type": "GET_BLOCKS", "from_height": 0})
+        if self._peer_chain_is_better(conn):
+            await self._request_chain_from(conn)
+
+    def _peer_chain_is_better(self, conn: PeerConnection) -> bool:
+        """Should we ask this peer for its chain?
+
+        Prefer cumulative work when the peer reports it. Fall back to height for
+        peers running an older build that does not send ``chain_work`` yet.
+        """
+        if conn.chain_work:
+            try:
+                return parse_work(conn.chain_work) > self.service.blockchain.chain_work()
+            except ValueError:
+                pass
+        return int(conn.height or 0) > self.service.blockchain.height()
 
     def _network_mismatch_reason(self, conn: PeerConnection) -> str | None:
         expected_network = self.identity["network_id"]
@@ -394,7 +517,7 @@ class P2PNode:
                 peer.get("name"),
                 peer.get("address"),
                 "outbound",
-                "known",
+                PeerStatus.KNOWN,
                 int(time.time()),
             )
             if format_host_port(ip, port) not in self.connections:
@@ -463,6 +586,15 @@ class P2PNode:
         source = self._source_label(conn)
         accepted, result = await self.service.receive_block(block, source=source)
         if not accepted:
+            if result == DISCONNECTED_BLOCK_REASON:
+                # Not an attack: either we lost a mining race, or this block
+                # arrived before its parent. Ask this peer for its chain so the
+                # heavier one can win instead of both sides staying split.
+                self.log(f"Block from {source} does not connect; requesting chain")
+                await self._request_chain_from(conn)
+                return
+            if result == "block already exists":
+                return
             self.service.record_security_event(
                 "invalid block",
                 source,
@@ -474,10 +606,27 @@ class P2PNode:
         if accepted and int(message.get("ttl", 0)) > 1:
             await self.broadcast_block(block, ttl=int(message["ttl"]) - 1, message_id=mid)
 
+    async def _request_chain_from(self, conn: PeerConnection) -> None:
+        try:
+            await send_json(conn.writer, {"type": "GET_BLOCKS", "from_height": 0})
+        except Exception as exc:
+            self.log(f"Chain request failed for {conn.key}: {exc}")
+
     async def _handle_get_blocks(self, conn: PeerConnection, message: dict[str, Any]) -> None:
         from_height = int(message.get("from_height") or 0)
         blocks = self.service.store.get_blocks_from_height(from_height)
         await send_json(conn.writer, {"type": "BLOCKS", "from_height": from_height, "blocks": blocks})
+
+    # Outcomes of a chain offer that are normal network behaviour rather than
+    # something a teacher should see on the security page.
+    BENIGN_SYNC_RESULTS = (
+        "less work",
+        "same work",
+        "not longer",
+        "no blocks",
+        "block already exists",
+        "replacement chain has no blocks after genesis",
+    )
 
     async def _handle_blocks(self, conn: PeerConnection, message: dict[str, Any]) -> None:
         accepted, result = await self.service.receive_blocks(
@@ -485,13 +634,16 @@ class P2PNode:
             from_height=int(message.get("from_height") or 0),
             source=self._source_label(conn),
         )
-        if not accepted:
-            self.service.record_security_event(
-                "invalid chain sync",
-                self._source_label(conn),
-                result,
-                **self._security_peer_fields(conn),
-            )
+        if accepted:
+            return
+        if any(marker in str(result) for marker in self.BENIGN_SYNC_RESULTS):
+            return
+        self.service.record_security_event(
+            "invalid chain sync",
+            self._source_label(conn),
+            result,
+            **self._security_peer_fields(conn),
+        )
 
     def known_peers(self) -> list[dict[str, Any]]:
         peers = self.service.store.list_peers()
@@ -534,6 +686,44 @@ class P2PNode:
             except Exception:
                 continue
         return count
+
+    async def request_blocks_from_better_peers(self) -> int:
+        """Ask only the peers that claim more work than us.
+
+        Called on a timer so a node that fell behind (or lost a mining race)
+        catches up on its own instead of waiting for somebody to press a button.
+        """
+        count = 0
+        for conn in list(self.connections.values()):
+            if not self._peer_chain_is_better(conn):
+                continue
+            await self._request_chain_from(conn)
+            count += 1
+        return count
+
+    async def ping_peers(self) -> None:
+        """Heartbeat that doubles as a tip announcement."""
+        status = {"type": "PING", **self._chain_status()}
+        for conn in list(self.connections.values()):
+            try:
+                await send_json(conn.writer, status)
+            except Exception:
+                continue
+
+    async def reconnect_known_peers(self) -> None:
+        """Retry peers we know about but are not currently connected to."""
+        for peer in self.service.store.list_peers():
+            ip = normalize_host(str(peer.get("ip") or ""))
+            port = int(peer.get("port") or 0)
+            if not ip or not port or self._is_self(ip, port):
+                continue
+            if str(peer.get("status")) in {PeerStatus.PARAM_MISMATCH, PeerStatus.BANNED}:
+                continue
+            if self.service.store.is_peer_banned(ip, port):
+                continue
+            if format_host_port(ip, port) in self.connections:
+                continue
+            self._track(asyncio.create_task(self.connect_peer(ip, port)))
 
     async def _broadcast(self, message: dict[str, Any]) -> None:
         dead: list[str] = []

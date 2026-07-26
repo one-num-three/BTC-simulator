@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any, Callable
+from collections import OrderedDict
+from collections.abc import Callable
+from typing import Any
 
 from app.core.block import (
+    MEDIAN_TIME_SPAN,
     compute_block_hash,
     create_block,
     difficulty_to_target,
     genesis_block,
     hash_meets_target,
+    header_work,
+    median_time_past,
     normalize_target_hex,
     target_preview,
     target_to_difficulty,
@@ -24,12 +29,19 @@ from app.storage.sqlite_store import SQLiteStore
 
 LogFn = Callable[[str], None]
 
+MAX_ORPHAN_BLOCKS = 64
+DISCONNECTED_BLOCK_REASON = "block does not connect to current tip"
+
 
 class Blockchain:
     def __init__(self, config: dict[str, Any], store: SQLiteStore, log: LogFn | None = None):
         self.config = config
         self.store = store
         self.log = log or (lambda _message: None)
+        # Blocks whose parent we have not seen yet. Without this a node that
+        # loses a mining race drops the winning block on the floor and the
+        # network stays split until somebody clicks "sync" by hand.
+        self.orphans: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.ensure_genesis()
 
     @property
@@ -39,6 +51,75 @@ class Blockchain:
     @property
     def max_block_transactions(self) -> int:
         return int(self.config["max_block_transactions"])
+
+    @property
+    def halving_interval(self) -> int:
+        return max(int(self.config.get("halving_interval", 20)), 1)
+
+    @property
+    def coinbase_maturity(self) -> int:
+        return max(int(self.config.get("coinbase_maturity", 0)), 0)
+
+    def block_subsidy(self, height: int) -> float:
+        """Newly issued coins at ``height``, halving on a fixed schedule.
+
+        This is the mechanism that gives Bitcoin a fixed supply, and it was the
+        one piece of the design the simulator did not model at all: the reward
+        was a constant read straight from the config, so the chain issued coins
+        forever and "why is there only ever 21 million?" had no answer here.
+        """
+        era = int(height) // self.halving_interval
+        if era >= 64:
+            return 0.0
+        value = float(self.config["mining_reward"]) / float(1 << era)
+        # below one satoshi the subsidy is gone for good
+        return 0.0 if value < 1e-8 else round(value, 8)
+
+    def max_supply(self) -> float:
+        """Total coins this chain will ever issue.
+
+        Each era pays ``halving_interval`` blocks, except that height 0 is the
+        genesis block and carries no coinbase, so the first era is one block
+        short. The result is deliberately not a round number: Bitcoin's cap is
+        20,999,999.9769 rather than 21,000,000 for the same kind of reason.
+        """
+        total = 0.0
+        era = 0
+        while era < 64:
+            subsidy = self.block_subsidy(era * self.halving_interval)
+            if subsidy <= 0:
+                break
+            total += subsidy * self.halving_interval
+            era += 1
+        total -= self.block_subsidy(0)  # genesis pays nothing
+        return round(total, 8)
+
+    def total_issued(self) -> float:
+        return self.store.total_issued()
+
+    def next_halving_height(self) -> int:
+        height = self.height()
+        return ((height // self.halving_interval) + 1) * self.halving_interval
+
+    def supply_policy(self) -> dict[str, Any]:
+        height = self.height()
+        issued = self.total_issued()
+        cap = self.max_supply()
+        return {
+            "halving_interval": self.halving_interval,
+            "coinbase_maturity": self.coinbase_maturity,
+            "era": height // self.halving_interval,
+            # Reward the *next* block will pay, and the reward after the next
+            # halving. Naming them apart avoids the confusion at a boundary
+            # where "current era" and "next block's subsidy" disagree.
+            "next_block_subsidy": self.block_subsidy(height + 1),
+            "subsidy_after_halving": self.block_subsidy(self.next_halving_height()),
+            "next_halving_height": self.next_halving_height(),
+            "blocks_to_halving": max(self.next_halving_height() - height, 0),
+            "total_issued": issued,
+            "max_supply": cap,
+            "issued_ratio": round(issued / cap, 6) if cap else 0.0,
+        }
 
     @property
     def auto_difficulty(self) -> bool:
@@ -227,12 +308,71 @@ class Blockchain:
     def tip_hash(self) -> str:
         return str(self.tip()["hash"])
 
+    def chain_work(self) -> int:
+        """Cumulative proof-of-work of the local chain."""
+        return self.store.tip_chain_work()
+
+    def median_time_past(self) -> int | None:
+        """Lower bound a new block's timestamp has to beat."""
+        return self.store.median_time_past()
+
+    def remember_orphan(self, block: dict[str, Any]) -> None:
+        block_hash = compute_block_hash(block)
+        if block_hash in self.orphans:
+            self.orphans.move_to_end(block_hash)
+            return
+        self.orphans[block_hash] = block
+        while len(self.orphans) > MAX_ORPHAN_BLOCKS:
+            self.orphans.popitem(last=False)
+
+    def connect_orphans(self, source: str = "orphan") -> int:
+        """Attach any cached orphans that now connect to the tip.
+
+        Called after every accepted block, so a block that arrived out of order
+        gets stitched on as soon as its parent shows up.
+        """
+        connected = 0
+        progress = True
+        while progress:
+            progress = False
+            tip_hash = self.tip_hash()
+            for block_hash, block in list(self.orphans.items()):
+                if block["header"].get("prev_hash") != tip_hash:
+                    continue
+                self.orphans.pop(block_hash, None)
+                accepted, _result = self.add_block(block, source=source, allow_orphan=False)
+                if accepted:
+                    connected += 1
+                    progress = True
+                break
+        return connected
+
     def get_balance(self, address: str) -> float:
         return self.store.confirmed_balance(address)
 
+    def immature_balance(self, address: str, spending_height: int | None = None) -> float:
+        """Mining income that exists on chain but is not spendable yet.
+
+        A coinbase at height H can be spent in a block at height h only once
+        ``h - H >= coinbase_maturity``. Without this rule a reorg can undo the
+        block that paid a miner *after* the miner has already spent the reward,
+        leaving the ledger short.
+        """
+        maturity = self.coinbase_maturity
+        if maturity <= 0:
+            return 0.0
+        height = int(spending_height if spending_height is not None else self.height() + 1)
+        return self.store.immature_coinbase_total(address, height - maturity)
+
+    def spendable_balance(self, address: str, spending_height: int | None = None) -> float:
+        """Confirmed balance minus coinbase that has not matured."""
+        return round(
+            self.get_balance(address) - self.immature_balance(address, spending_height), 8
+        )
+
     def get_available_balance(self, address: str, exclude_tx_id: str | None = None) -> float:
         pending = self.store.pending_outgoing(address, exclude_tx_id=exclude_tx_id)
-        return round(self.get_balance(address) - pending, 8)
+        return round(self.spendable_balance(address) - pending, 8)
 
     def validate_transfer_transaction(
         self,
@@ -252,7 +392,7 @@ class Blockchain:
         if include_mempool:
             available = self.get_available_balance(tx["sender"], exclude_tx_id=tx_id)
         else:
-            available = self.get_balance(tx["sender"])
+            available = self.spendable_balance(tx["sender"])
         if available + 1e-8 < required:
             raise ValueError(f"insufficient available balance: need {required}, have {available}")
 
@@ -292,11 +432,17 @@ class Blockchain:
         if self.store.has_block_hash(block_hash):
             raise ValueError("block already exists")
         if header["prev_hash"] != self.tip_hash():
-            raise ValueError("block does not connect to current tip")
+            raise ValueError(DISCONNECTED_BLOCK_REASON)
 
         now = int(time.time())
         if int(header["timestamp"]) > now + 2 * 60 * 60:
             raise ValueError("block timestamp is too far in the future")
+        floor = self.median_time_past()
+        if floor is not None and int(header["timestamp"]) < floor:
+            raise ValueError(
+                "block timestamp must not be older than the median of the last "
+                f"{MEDIAN_TIME_SPAN} blocks ({floor})"
+            )
         return block_hash
 
     def validate_block(self, block: dict[str, Any]) -> str:
@@ -327,6 +473,7 @@ class Blockchain:
         seen_tx_ids: set[str] = set()
         temp_balances: dict[str, float] = {}
         total_fees = 0.0
+        block_height = self.height() + 1
         for tx in transactions:
             tx_id = tx["tx_id"]
             if tx_id in seen_tx_ids:
@@ -342,21 +489,26 @@ class Blockchain:
             sender = tx["sender"]
             receiver = tx["receiver"]
             if sender not in temp_balances:
-                temp_balances[sender] = self.get_balance(sender)
+                temp_balances[sender] = self.spendable_balance(sender, block_height)
             if receiver not in temp_balances:
                 temp_balances[receiver] = self.get_balance(receiver)
 
             required = round(float(tx["amount"]) + float(tx["fee"]), 8)
             if temp_balances[sender] + 1e-8 < required:
-                raise ValueError(f"block spends more than available balance for {sender[:16]}")
+                raise ValueError(
+                    f"block spends more than the spendable balance for {sender[:16]} "
+                    "(immature mining rewards cannot be spent yet)"
+                )
             temp_balances[sender] = round(temp_balances[sender] - required, 8)
             temp_balances[receiver] = round(temp_balances[receiver] + float(tx["amount"]), 8)
             total_fees = round(total_fees + float(tx["fee"]), 8)
 
-        expected_coinbase = round(self.mining_reward + total_fees, 8)
+        subsidy = self.block_subsidy(block_height)
+        expected_coinbase = round(subsidy + total_fees, 8)
         if not math.isclose(float(coinbase["amount"]), expected_coinbase, abs_tol=1e-8):
             raise ValueError(
-                f"coinbase amount must equal reward plus fees: expected {expected_coinbase}"
+                f"coinbase amount must equal subsidy plus fees: expected {expected_coinbase} "
+                f"(subsidy {subsidy} at height {block_height} + fees {total_fees})"
             )
         return block_hash
 
@@ -372,8 +524,22 @@ class Blockchain:
         block_hashes = [expected_genesis_hash]
         balances: dict[str, float] = {}
         seen_tx_ids: set[str] = set()
+        timestamps: list[int] = [int(expected_genesis["header"]["timestamp"])]
+        now = int(time.time())
+        maturity = self.coinbase_maturity
+        # Coinbase outputs waiting to mature: (mined_height, receiver, amount).
+        locked_coinbases: list[tuple[int, str, float]] = []
 
         for height, block in enumerate(blocks[1:], start=1):
+            # Release any mining reward that is now buried deep enough to spend.
+            still_locked: list[tuple[int, str, float]] = []
+            for mined_height, receiver, amount in locked_coinbases:
+                if height - mined_height >= maturity:
+                    balances[receiver] = round(balances.get(receiver, 0.0) + amount, 8)
+                else:
+                    still_locked.append((mined_height, receiver, amount))
+            locked_coinbases = still_locked
+
             if "header" not in block or "transactions" not in block:
                 raise ValueError(f"block {height} must contain header and transactions")
             header = block["header"]
@@ -403,6 +569,17 @@ class Blockchain:
                 )
             if not hash_meets_target(block_hash, actual_target):
                 raise ValueError(f"block {height} hash does not meet its header target")
+
+            timestamp = int(header["timestamp"])
+            if timestamp > now + 2 * 60 * 60:
+                raise ValueError(f"block {height} timestamp is too far in the future")
+            floor = median_time_past(timestamps)
+            if floor is not None and timestamp < floor:
+                raise ValueError(
+                    f"block {height} timestamp {timestamp} is older than "
+                    f"the median time past ({floor})"
+                )
+            timestamps.append(timestamp)
 
             transactions = block.get("transactions", [])
             if not isinstance(transactions, list):
@@ -440,13 +617,17 @@ class Blockchain:
                 balance_delta[receiver] = round(balance_delta.get(receiver, 0.0) + float(tx["amount"]), 8)
                 total_fees = round(total_fees + float(tx["fee"]), 8)
 
-            expected_coinbase = round(self.mining_reward + total_fees, 8)
+            expected_coinbase = round(self.block_subsidy(height) + total_fees, 8)
             if not math.isclose(float(coinbase["amount"]), expected_coinbase, abs_tol=1e-8):
-                raise ValueError(f"block {height} coinbase amount is invalid")
+                raise ValueError(
+                    f"block {height} coinbase amount is invalid: "
+                    f"expected {expected_coinbase}, got {coinbase['amount']}"
+                )
             seen_tx_ids.add(coinbase["tx_id"])
-            balance_delta[coinbase["receiver"]] = round(
-                balance_delta.get(coinbase["receiver"], 0.0) + float(coinbase["amount"]),
-                8,
+            # The reward is NOT credited here: it only becomes spendable once
+            # `coinbase_maturity` further blocks are on top of it.
+            locked_coinbases.append(
+                (height, str(coinbase["receiver"]), float(coinbase["amount"]))
             )
             for address, delta in balance_delta.items():
                 balances[address] = round(balances.get(address, 0.0) + delta, 8)
@@ -457,41 +638,85 @@ class Blockchain:
 
     def replace_with_chain(self, blocks: list[dict[str, Any]], source: str = "sync") -> tuple[bool, str]:
         remote_height = len(blocks) - 1
-        if remote_height <= self.height():
-            return False, "replacement chain is not longer"
+        local_work = self.chain_work()
+
+        # Cheap pre-filter only. The real comparison is on cumulative work and
+        # happens after validation, because an unvalidated chain can claim any
+        # difficulty it likes -- the work is only meaningful once every block
+        # has been shown to actually meet its own target.
+        if remote_height <= 0:
+            return False, "replacement chain has no blocks after genesis"
+
         try:
             block_hashes = self.validate_chain_replacement(blocks)
         except ValueError as exc:
             return False, str(exc)
 
+        remote_work = sum(header_work(block["header"]) for block in blocks[1:])
+        if remote_work < local_work:
+            return False, (
+                f"replacement chain has less work: {remote_work} < {local_work}"
+            )
+        if remote_work == local_work:
+            # Equal work is a tie. Bitcoin keeps whatever it saw first, which
+            # is what makes "first seen wins" the tie-break rule students meet
+            # in the classroom demo.
+            return False, "replacement chain has the same work as the local chain"
+
         self.store.replace_chain(blocks, block_hashes)
+        self.orphans.clear()
         self.log(
             f"Chain replaced from {source}: height {remote_height}, "
-            f"tip {block_hashes[-1][:16]}"
+            f"work {remote_work} > {local_work}, tip {block_hashes[-1][:16]}"
         )
         return True, block_hashes[-1]
 
-    def add_block(self, block: dict[str, Any], source: str = "local") -> tuple[bool, str]:
+    def add_block(
+        self,
+        block: dict[str, Any],
+        source: str = "local",
+        allow_orphan: bool = True,
+    ) -> tuple[bool, str]:
         block_hash = compute_block_hash(block)
         if self.store.has_block_hash(block_hash):
             return False, "block already exists"
         try:
             validated_hash = self.validate_block(block)
         except ValueError as exc:
-            return False, str(exc)
+            reason = str(exc)
+            if allow_orphan and reason == DISCONNECTED_BLOCK_REASON:
+                # Keep it: it is either a competing tip or a block that arrived
+                # before its parent. Either way the caller should now ask the
+                # sender for the chain it belongs to.
+                self.remember_orphan(block)
+            return False, reason
 
         height = self.height() + 1
         self.store.insert_block(height, validated_hash, block)
         confirmed_ids = [tx["tx_id"] for tx in block.get("transactions", []) if tx.get("type") != "coinbase"]
         self.store.remove_mempool_transactions(confirmed_ids)
         self.log(f"Block accepted from {source}: height {height}, hash {validated_hash[:16]}")
+        self.connect_orphans()
         return True, validated_hash
 
     def select_transactions_for_block(self, max_transfers: int) -> list[dict[str, Any]]:
+        """Pick transactions for the next block, highest fee rate first.
+
+        The store orders by raw fee; a miner cares about fee per byte, since
+        block space is the scarce thing.
+        """
         selected: list[dict[str, Any]] = []
         temp_balances: dict[str, float] = {}
 
-        for tx in self.store.list_mempool_transactions():
+        candidates = self.store.list_mempool_transactions()
+        candidates.sort(
+            key=lambda tx: (
+                float(tx.get("fee", 0.0)) / max(len(str(tx)), 1),
+                -int(tx.get("timestamp", 0)),
+            ),
+            reverse=True,
+        )
+        for tx in candidates:
             if len(selected) >= max_transfers:
                 break
             try:
@@ -501,7 +726,7 @@ class Blockchain:
                 sender = tx["sender"]
                 receiver = tx["receiver"]
                 if sender not in temp_balances:
-                    temp_balances[sender] = self.get_balance(sender)
+                    temp_balances[sender] = self.spendable_balance(sender)
                 if receiver not in temp_balances:
                     temp_balances[receiver] = self.get_balance(receiver)
                 required = round(float(tx["amount"]) + float(tx["fee"]), 8)
@@ -515,17 +740,26 @@ class Blockchain:
         return selected
 
     def create_candidate_block(self, miner_address: str, transfers: list[dict[str, Any]]) -> dict[str, Any]:
+        next_height = self.height() + 1
         fees = round(sum(float(tx["fee"]) for tx in transfers), 8)
         coinbase = create_coinbase(
             miner_address,
-            round(self.mining_reward + fees, 8),
-            height=self.height() + 1,
+            round(self.block_subsidy(next_height) + fees, 8),
+            height=next_height,
         )
-        next_height = self.height() + 1
         target = self.expected_target(next_height)
         return create_block(
             prev_hash=self.tip_hash(),
             transactions=[coinbase, *transfers],
             difficulty=target_to_difficulty(target),
             target=target,
+            timestamp=self.next_block_timestamp(),
         )
+
+    def next_block_timestamp(self) -> int:
+        """Wall clock, but never older than the median time past."""
+        now = int(time.time())
+        floor = self.median_time_past()
+        if floor is None:
+            return now
+        return max(now, int(floor))

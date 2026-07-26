@@ -3,3 +3,7 @@ __pycache__/
 .pytest_cache/
 data/*.db
 data/*.db-*
+data/admin_token
+lab_tasks.json
+data/
+.ruff_cache/

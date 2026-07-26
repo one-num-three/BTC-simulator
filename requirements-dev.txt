@@ -1,0 +1,10 @@
+# Everything needed to run the test suite and the linter.
+#   python -m pip install -r requirements-dev.txt
+#
+# httpx is required by fastapi.testclient (tests/test_api.py). It is a test-only
+# dependency: running a node needs nothing beyond requirements.txt, and
+# scripts/smoke_test.py deliberately uses only the standard library so it can
+# verify a plain `pip install -r requirements.txt` install.
+-r requirements.txt
+httpx==0.28.1
+ruff==0.14.0

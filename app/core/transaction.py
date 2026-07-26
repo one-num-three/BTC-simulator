@@ -7,7 +7,6 @@ from app.core.wallet import address_from_public_key, sign_payload, verify_signat
 from app.utils.crypto import hash_json
 from app.utils.serialization import canonical_json_bytes
 
-
 TRANSFER_REQUIRED_FIELDS = {
     "tx_id",
     "type",

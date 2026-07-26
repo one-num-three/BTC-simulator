@@ -3,10 +3,13 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
   <title>BTC Simulator</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
   <div class="app-shell">
     <header class="topbar">
       <div>
@@ -14,6 +17,8 @@
         <h1 id="nodeName">节点控制台</h1>
       </div>
       <div class="top-actions">
+        <span class="conn-pill" id="connPill" role="status" aria-live="polite" data-state="connecting">连接中</span>
+        <button class="ghost-btn icon-btn" id="themeBtn" type="button" aria-label="切换深色模式" title="切换深色模式">◐</button>
         <button class="ghost-btn" id="refreshBtn" type="button">刷新状态</button>
         <button class="primary-btn" id="syncTopBtn" type="button">同步区块</button>
       </div>
@@ -28,7 +33,7 @@
       <div class="metric">
         <span>区块高度</span>
         <strong id="height">0</strong>
-        <small id="tipHash">00000000</small>
+        <small id="tipHash">--</small>
       </div>
       <div class="metric">
         <span>连接</span>
@@ -46,26 +51,29 @@
         <small id="mempoolBytes">0 B</small>
       </div>
       <div class="metric">
-        <span>版本</span>
-        <strong id="version">v0.1.0</strong>
-        <small id="lastBlockTime">--</small>
+        <span>区块奖励</span>
+        <strong id="subsidyValue">--</strong>
+        <small id="halvingHint">--</small>
       </div>
     </section>
 
-    <nav class="tabs" aria-label="页面">
-      <button class="tab active" data-tab="mining" type="button">挖矿</button>
-      <button class="tab" data-tab="send" type="button">发送</button>
-      <button class="tab" data-tab="receive" type="button">接收</button>
-      <button class="tab" data-tab="nodes" type="button">节点</button>
-      <button class="tab" data-tab="explorer" type="button">浏览器</button>
-      <button class="tab" data-tab="join" type="button">入网</button>
-      <button class="tab" data-tab="lab" type="button">实验</button>
-      <button class="tab" data-tab="security" type="button">安全</button>
-      <button class="tab admin-only" data-tab="classroom" type="button" hidden>教师</button>
+    <nav class="tabs" role="tablist" aria-label="页面">
+      <button class="tab active" role="tab" id="tabbtn-mining" aria-controls="tab-mining" aria-selected="true" data-tab="mining" type="button">挖矿</button>
+      <button class="tab" role="tab" id="tabbtn-send" aria-controls="tab-send" aria-selected="false" tabindex="-1" data-tab="send" type="button">发送</button>
+      <button class="tab" role="tab" id="tabbtn-receive" aria-controls="tab-receive" aria-selected="false" tabindex="-1" data-tab="receive" type="button">钱包</button>
+      <button class="tab" role="tab" id="tabbtn-history" aria-controls="tab-history" aria-selected="false" tabindex="-1" data-tab="history" type="button">交易</button>
+      <button class="tab" role="tab" id="tabbtn-nodes" aria-controls="tab-nodes" aria-selected="false" tabindex="-1" data-tab="nodes" type="button">节点</button>
+      <button class="tab" role="tab" id="tabbtn-explorer" aria-controls="tab-explorer" aria-selected="false" tabindex="-1" data-tab="explorer" type="button">浏览器</button>
+      <button class="tab" role="tab" id="tabbtn-charts" aria-controls="tab-charts" aria-selected="false" tabindex="-1" data-tab="charts" type="button">图表</button>
+      <button class="tab" role="tab" id="tabbtn-join" aria-controls="tab-join" aria-selected="false" tabindex="-1" data-tab="join" type="button">入网</button>
+      <button class="tab" role="tab" id="tabbtn-lab" aria-controls="tab-lab" aria-selected="false" tabindex="-1" data-tab="lab" type="button">实验</button>
+      <button class="tab" role="tab" id="tabbtn-security" aria-controls="tab-security" aria-selected="false" tabindex="-1" data-tab="security" type="button">安全</button>
+      <button class="tab admin-only" role="tab" id="tabbtn-classroom" aria-controls="tab-classroom" aria-selected="false" tabindex="-1" data-tab="classroom" type="button" hidden>教师</button>
     </nav>
 
-    <main>
-      <section class="tab-panel active" id="tab-mining">
+    <main id="main">
+      <!-- ------------------------------------------------------ 挖矿 -->
+      <section class="tab-panel active" role="tabpanel" aria-labelledby="tabbtn-mining" id="tab-mining" tabindex="0">
         <div class="work-grid">
           <section class="panel">
             <div class="panel-head">
@@ -91,17 +99,25 @@
                 <span>当前目标</span>
                 <output class="mono" id="miningDifficulty">--</output>
               </div>
+              <div class="detail-cell">
+                <span>累计工作量</span>
+                <output class="mono" id="chainWork">--</output>
+              </div>
+              <div class="detail-cell">
+                <span>孤块缓存</span>
+                <output id="orphanCount">0</output>
+              </div>
               <div class="detail-cell span-2">
                 <span id="hashLabel">候选 Hash</span>
-                <output class="mono hash-output" id="currentHash">--</output>
+                <output class="mono hash-output copyable" id="currentHash" data-copy="" tabindex="0">--</output>
               </div>
               <div class="detail-cell span-2">
                 <span>链头 Hash</span>
-                <output class="mono hash-output" id="tipHashFull">--</output>
+                <output class="mono hash-output copyable" id="tipHashFull" data-copy="" tabindex="0">--</output>
               </div>
               <div class="detail-cell span-2">
                 <span>矿工地址</span>
-                <output class="mono hash-output" id="walletAddressShort">--</output>
+                <output class="mono hash-output copyable" id="walletAddressShort" data-copy="" tabindex="0">--</output>
               </div>
             </div>
             <div class="chain-tools admin-only" id="adminChainTools" hidden>
@@ -122,23 +138,28 @@
                 <button class="danger-btn" id="resetChainBtn" type="button">重置到创世块</button>
               </div>
             </div>
+            <p class="admin-hint" id="adminHint" hidden></p>
           </section>
 
           <section class="panel">
             <div class="panel-head">
               <h2>最近日志</h2>
-              <button class="ghost-btn" id="refreshLogsBtn" type="button">刷新</button>
+              <div class="button-row">
+                <input class="filter-input" id="logFilter" type="search" placeholder="过滤日志" aria-label="过滤日志">
+                <button class="ghost-btn" id="refreshLogsBtn" type="button">刷新</button>
+              </div>
             </div>
             <div class="log-list" id="logs"></div>
           </section>
         </div>
       </section>
 
-      <section class="tab-panel" id="tab-send">
+      <!-- ------------------------------------------------------ 发送 -->
+      <section class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-send" id="tab-send" tabindex="0" hidden>
         <section class="panel">
           <div class="panel-head">
             <h2>发送交易</h2>
-            <button class="ghost-btn" id="autoFeeBtn" type="button">自动手续费</button>
+            <button class="ghost-btn" id="autoFeeBtn" type="button">推荐手续费</button>
           </div>
           <form class="form-grid" id="sendForm">
             <label class="wide">
@@ -153,53 +174,162 @@
               <span>手续费</span>
               <input id="feeInput" name="fee" type="number" min="0" step="0.00000001" value="0.01" required>
             </label>
-            <label>
-              <span>到账确认块数（仅展示）</span>
-              <input id="confirmationsInput" name="confirmations" type="number" min="1" step="1" value="10" readonly>
-            </label>
             <label class="wide">
               <span>备注</span>
-              <input id="noteInput" name="note" autocomplete="off">
+              <input id="noteInput" name="note" autocomplete="off" maxlength="280">
             </label>
             <div class="form-actions wide">
               <button class="primary-btn" type="submit">发送</button>
               <button class="ghost-btn" id="clearSendBtn" type="button">清空</button>
             </div>
           </form>
+          <p class="form-hint" id="sendHint">可用余额会扣掉内存池里尚未确认的支出；挖矿奖励要过了成熟期才算可用。</p>
+          <div class="receipt" id="sendReceipt" hidden>
+            <div class="panel-head">
+              <h3>刚刚发出的交易</h3>
+              <button class="ghost-btn" id="receiptViewBtn" type="button">在交易页查看</button>
+            </div>
+            <output class="mono hash-output copyable" id="receiptTxId" data-copy="" tabindex="0">--</output>
+          </div>
         </section>
       </section>
 
-      <section class="tab-panel" id="tab-receive">
+      <!-- ------------------------------------------------------ 钱包 -->
+      <section class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-receive" id="tab-receive" tabindex="0" hidden>
+        <div class="work-grid">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>接收地址</h2>
+              <div class="button-row">
+                <button class="ghost-btn" id="copyAddressBtn" type="button">复制地址</button>
+                <button class="primary-btn" id="generateAddressBtn" type="button">新建钱包</button>
+              </div>
+            </div>
+            <div class="address-box">
+              <span>默认地址</span>
+              <code class="copyable" id="walletAddress" data-copy="" tabindex="0">--</code>
+            </div>
+            <div class="qr-box compact">
+              <canvas id="addressQr" width="180" height="180" role="img" aria-label="收款地址二维码"></canvas>
+            </div>
+            <div class="receive-grid">
+              <label>
+                <span>名字</span>
+                <output id="walletName">default</output>
+              </label>
+              <label>
+                <span>已确认余额</span>
+                <output id="receiveBalance">0 BTC</output>
+              </label>
+              <label>
+                <span>未成熟奖励</span>
+                <output id="receiveImmature">0 BTC</output>
+              </label>
+              <label>
+                <span>连接状态</span>
+                <output id="receivePeers">0 个节点</output>
+              </label>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>钱包管理</h2>
+              <button class="ghost-btn" id="refreshWalletsBtn" type="button">刷新</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <caption class="sr-only">本节点上的钱包</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">名字</th>
+                    <th scope="col">地址</th>
+                    <th scope="col">余额</th>
+                    <th scope="col">可用</th>
+                    <th scope="col">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="walletsTable"></tbody>
+              </table>
+            </div>
+            <div class="key-tools admin-only" hidden>
+              <div class="panel-head">
+                <h3>私钥备份</h3>
+                <button class="ghost-btn" id="exportKeyBtn" type="button">导出当前私钥</button>
+              </div>
+              <p class="warn-text">私钥以明文保存和导出，只用于教学演示，绝不能用于真实资产。</p>
+              <output class="mono hash-output copyable" id="exportedKey" data-copy="" tabindex="0" hidden>--</output>
+              <form class="peer-form" id="importForm">
+                <label class="wide">
+                  <span>导入私钥（64 位十六进制）</span>
+                  <input id="importKeyInput" autocomplete="off" placeholder="粘贴私钥">
+                </label>
+                <button class="primary-btn" type="submit">导入</button>
+              </form>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------------ 交易 -->
+      <section class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-history" id="tab-history" tabindex="0" hidden>
         <section class="panel">
           <div class="panel-head">
-            <h2>接收地址</h2>
+            <h2>交易记录</h2>
             <div class="button-row">
-              <button class="ghost-btn" id="copyAddressBtn" type="button">复制地址</button>
-              <button class="primary-btn" id="generateAddressBtn" type="button">生成地址</button>
+              <button class="ghost-btn" id="exportTxBtn" type="button">导出 CSV</button>
+              <button class="ghost-btn" id="refreshHistoryBtn" type="button">刷新</button>
             </div>
           </div>
-          <div class="address-box">
-            <span>默认地址</span>
-            <code id="walletAddress">--</code>
+          <div class="block-search">
+            <input id="historyAddressInput" placeholder="查看某个地址的记录，留空表示本机钱包" aria-label="地址">
+            <button class="ghost-btn" id="historyAddressBtn" type="button">查询</button>
           </div>
-          <div class="receive-grid">
-            <label>
-              <span>名字</span>
-              <output id="walletName">default</output>
-            </label>
-            <label>
-              <span>当前余额</span>
-              <output id="receiveBalance">0 BTC</output>
-            </label>
-            <label>
-              <span>连接状态</span>
-              <output id="receivePeers">0 个节点</output>
-            </label>
+          <div class="summary-strip" id="historySummary"></div>
+          <h3 class="subhead">待确认</h3>
+          <div class="table-wrap">
+            <table>
+              <caption class="sr-only">内存池中的待确认交易</caption>
+              <thead>
+                <tr>
+                  <th scope="col">方向</th>
+                  <th scope="col">Tx ID</th>
+                  <th scope="col">对方</th>
+                  <th scope="col">数量</th>
+                  <th scope="col">手续费</th>
+                  <th scope="col">时间</th>
+                </tr>
+              </thead>
+              <tbody id="pendingTable"></tbody>
+            </table>
+          </div>
+          <h3 class="subhead">已确认</h3>
+          <div class="table-wrap">
+            <table>
+              <caption class="sr-only">已经打包进区块的交易</caption>
+              <thead>
+                <tr>
+                  <th scope="col">方向</th>
+                  <th scope="col">Tx ID</th>
+                  <th scope="col">对方</th>
+                  <th scope="col">数量</th>
+                  <th scope="col">手续费</th>
+                  <th scope="col">高度</th>
+                  <th scope="col">确认数</th>
+                </tr>
+              </thead>
+              <tbody id="historyTable"></tbody>
+            </table>
+          </div>
+          <div class="button-row pager">
+            <button class="ghost-btn" id="prevHistoryBtn" type="button">上一页</button>
+            <button class="ghost-btn" id="nextHistoryBtn" type="button">下一页</button>
           </div>
         </section>
       </section>
 
-      <section class="tab-panel" id="tab-nodes">
+      <!-- ------------------------------------------------------ 节点 -->
+      <section class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-nodes" id="tab-nodes" tabindex="0" hidden>
         <div class="work-grid">
           <section class="panel">
             <div class="panel-head">
@@ -217,25 +347,31 @@
               </label>
               <button class="primary-btn" type="submit">连接节点</button>
             </form>
+            <p class="form-hint">IPv6 直接填地址即可，不用加方括号。连不上会在几秒后返回超时，不会一直转圈。</p>
           </section>
 
           <section class="panel">
             <div class="panel-head">
               <h2>节点列表</h2>
-              <button class="ghost-btn" id="refreshPeersBtn" type="button">刷新节点</button>
+              <div class="button-row">
+                <button class="ghost-btn" id="exportPeersBtn" type="button">导出 CSV</button>
+                <button class="ghost-btn" id="refreshPeersBtn" type="button">刷新节点</button>
+              </div>
             </div>
             <div class="table-wrap">
               <table>
+                <caption class="sr-only">已知节点</caption>
                 <thead>
                   <tr>
-                    <th>序号</th>
-                    <th>IP</th>
-                    <th>Port</th>
-                    <th>名字</th>
-                    <th>地址</th>
-                    <th>状态</th>
-                    <th>方向</th>
-                    <th>最后通信</th>
+                    <th scope="col">序号</th>
+                    <th scope="col">IP:Port</th>
+                    <th scope="col">名字</th>
+                    <th scope="col">地址</th>
+                    <th scope="col">高度</th>
+                    <th scope="col">状态</th>
+                    <th scope="col">方向</th>
+                    <th scope="col">最后通信</th>
+                    <th scope="col">操作</th>
                   </tr>
                 </thead>
                 <tbody id="peersTable"></tbody>
@@ -245,7 +381,8 @@
         </div>
       </section>
 
-      <section class="tab-panel" id="tab-explorer">
+      <!-- ------------------------------------------------- 区块浏览器 -->
+      <section class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-explorer" id="tab-explorer" tabindex="0" hidden>
         <div class="explorer-grid">
           <section class="panel">
             <div class="panel-head">
@@ -257,19 +394,22 @@
               </div>
             </div>
             <div class="block-search">
-              <input id="blockSearchInput" placeholder="输入区块高度或 hash">
+              <input id="blockSearchInput" placeholder="区块高度 / 区块 hash / 交易 ID / 钱包地址" aria-label="搜索">
               <button class="ghost-btn" id="blockSearchBtn" type="button">查询</button>
             </div>
+            <div class="search-result" id="searchResult" hidden></div>
+            <div class="fork-banner" id="forkBanner" hidden></div>
             <div class="table-wrap block-table-wrap">
               <table>
+                <caption class="sr-only">区块列表</caption>
                 <thead>
                   <tr>
-                    <th>高度</th>
-                    <th>Hash</th>
-                    <th>交易</th>
-                    <th>目标</th>
-                    <th>Nonce</th>
-                    <th>时间</th>
+                    <th scope="col">高度</th>
+                    <th scope="col">Hash</th>
+                    <th scope="col">交易</th>
+                    <th scope="col">目标</th>
+                    <th scope="col">Nonce</th>
+                    <th scope="col">时间</th>
                   </tr>
                 </thead>
                 <tbody id="blocksTable"></tbody>
@@ -280,20 +420,23 @@
           <section class="panel">
             <div class="panel-head">
               <h2>区块详情</h2>
-              <span class="detail-chip" id="blockDetailTitle">未选择</span>
+              <div class="button-row">
+                <button class="ghost-btn" id="showHeaderBtn" type="button">看 80 字节区块头</button>
+                <span class="detail-chip" id="blockDetailTitle">未选择</span>
+              </div>
             </div>
             <div class="block-detail-grid">
               <div class="detail-cell span-2">
                 <span>Hash</span>
-                <output class="mono hash-output" id="detailHash">--</output>
+                <output class="mono hash-output copyable" id="detailHash" data-copy="" tabindex="0">--</output>
               </div>
               <div class="detail-cell span-2">
                 <span>Prev Hash</span>
-                <output class="mono hash-output" id="detailPrevHash">--</output>
+                <output class="mono hash-output copyable" id="detailPrevHash" data-copy="" tabindex="0">--</output>
               </div>
               <div class="detail-cell span-2">
                 <span>Merkle Root</span>
-                <output class="mono hash-output" id="detailMerkle">--</output>
+                <output class="mono hash-output copyable" id="detailMerkle" data-copy="" tabindex="0">--</output>
               </div>
               <div class="detail-cell">
                 <span>时间</span>
@@ -315,24 +458,102 @@
             <h3 class="subhead">区块交易</h3>
             <div class="table-wrap tx-table-wrap">
               <table>
+                <caption class="sr-only">区块内的交易</caption>
                 <thead>
                   <tr>
-                    <th>类型</th>
-                    <th>Tx ID</th>
-                    <th>发送方</th>
-                    <th>接收方</th>
-                    <th>数量</th>
-                    <th>手续费</th>
+                    <th scope="col">类型</th>
+                    <th scope="col">Tx ID</th>
+                    <th scope="col">发送方</th>
+                    <th scope="col">接收方</th>
+                    <th scope="col">数量</th>
+                    <th scope="col">手续费</th>
+                    <th scope="col">Merkle</th>
                   </tr>
                 </thead>
                 <tbody id="blockTxTable"></tbody>
               </table>
             </div>
+            <div class="proof-box" id="headerBox" hidden>
+              <div class="panel-head">
+                <h3>真实比特币区块头（80 字节）</h3>
+                <button class="ghost-btn" id="closeHeaderBtn" type="button">关闭</button>
+              </div>
+              <p class="form-hint" id="headerNote">--</p>
+              <output class="mono hash-output copyable" id="headerHex" data-copy="" tabindex="0">--</output>
+              <div class="table-wrap">
+                <table>
+                  <caption class="sr-only">区块头逐字段拆解</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">字段</th>
+                      <th scope="col">字节</th>
+                      <th scope="col">十六进制</th>
+                      <th scope="col">值</th>
+                      <th scope="col">说明</th>
+                    </tr>
+                  </thead>
+                  <tbody id="headerFields"></tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="proof-box" id="proofBox" hidden>
+              <div class="panel-head">
+                <h3>Merkle 包含性证明</h3>
+                <button class="ghost-btn" id="closeProofBtn" type="button">关闭</button>
+              </div>
+              <p class="form-hint" id="proofSummary">--</p>
+              <ol class="proof-steps" id="proofSteps"></ol>
+            </div>
           </section>
         </div>
       </section>
 
-      <section class="tab-panel" id="tab-join">
+      <!-- ------------------------------------------------------ 图表 -->
+      <section class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-charts" id="tab-charts" tabindex="0" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>链上统计</h2>
+            <button class="ghost-btn" id="refreshChartsBtn" type="button">刷新</button>
+          </div>
+          <div class="summary-strip" id="chartSummary"></div>
+          <div class="chart-grid">
+            <figure class="chart-card">
+              <figcaption>出块间隔（秒）</figcaption>
+              <canvas id="chartInterval" width="520" height="200" role="img" aria-label="出块间隔折线图"></canvas>
+              <p class="chart-note" id="noteInterval">--</p>
+            </figure>
+            <figure class="chart-card">
+              <figcaption>难度（二进制前导零位）</figcaption>
+              <canvas id="chartDifficulty" width="520" height="200" role="img" aria-label="难度折线图"></canvas>
+              <p class="chart-note" id="noteDifficulty">--</p>
+            </figure>
+            <figure class="chart-card">
+              <figcaption>估算算力（H/s）</figcaption>
+              <canvas id="chartHashrate" width="520" height="200" role="img" aria-label="算力折线图"></canvas>
+              <p class="chart-note" id="noteHashrate">--</p>
+            </figure>
+            <figure class="chart-card">
+              <figcaption>累计发行量</figcaption>
+              <canvas id="chartIssued" width="520" height="200" role="img" aria-label="累计发行量折线图"></canvas>
+              <p class="chart-note" id="noteIssued">--</p>
+            </figure>
+            <figure class="chart-card">
+              <figcaption>每块奖励与手续费</figcaption>
+              <canvas id="chartReward" width="520" height="200" role="img" aria-label="奖励与手续费柱状图"></canvas>
+              <p class="chart-note" id="noteReward">--</p>
+            </figure>
+            <figure class="chart-card">
+              <figcaption>内存池费率分布</figcaption>
+              <canvas id="chartMempool" width="520" height="200" role="img" aria-label="内存池费率柱状图"></canvas>
+              <p class="chart-note" id="noteMempool">--</p>
+            </figure>
+          </div>
+        </section>
+      </section>
+
+      <!-- ------------------------------------------------------ 入网 -->
+      <section class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-join" id="tab-join" tabindex="0" hidden>
         <div class="join-grid">
           <section class="panel">
             <div class="panel-head">
@@ -342,11 +563,11 @@
             <div class="info-grid">
               <div class="detail-cell span-2">
                 <span>Web 控制台</span>
-                <output class="mono hash-output" id="joinWebUrl">--</output>
+                <output class="mono hash-output copyable" id="joinWebUrl" data-copy="" tabindex="0">--</output>
               </div>
               <div class="detail-cell span-2">
                 <span>P2P 地址</span>
-                <output class="mono hash-output" id="joinP2pAddress">--</output>
+                <output class="mono hash-output copyable" id="joinP2pAddress" data-copy="" tabindex="0">--</output>
               </div>
               <div class="detail-cell">
                 <span>Network ID</span>
@@ -354,7 +575,7 @@
               </div>
               <div class="detail-cell">
                 <span>参数 Hash</span>
-                <output class="mono" id="joinParamsHash">--</output>
+                <output class="mono copyable" id="joinParamsHash" data-copy="" tabindex="0">--</output>
               </div>
             </div>
             <div class="button-row join-actions">
@@ -369,14 +590,16 @@
               <span class="detail-chip">P2P</span>
             </div>
             <div class="qr-box">
-              <canvas id="joinQr" width="164" height="164" aria-label="P2P 入网码"></canvas>
+              <canvas id="joinQr" width="220" height="220" role="img" aria-label="P2P 入网二维码"></canvas>
               <code id="joinQrText">--</code>
+              <p class="chart-note" id="joinQrNote">用手机相机扫这张码即可拿到本节点的 P2P 地址。</p>
             </div>
           </section>
         </div>
       </section>
 
-      <section class="tab-panel" id="tab-lab">
+      <!-- ------------------------------------------------------ 实验 -->
+      <section class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-lab" id="tab-lab" tabindex="0" hidden>
         <div class="lab-grid">
           <section class="panel">
             <div class="panel-head">
@@ -384,6 +607,7 @@
               <button class="ghost-btn" id="refreshLabBtn" type="button">刷新进度</button>
             </div>
             <div class="lab-list" id="labList"></div>
+            <p class="form-hint">任务清单来自服务端，老师可以在配置目录放一个 <code>lab_tasks.json</code> 覆盖它。</p>
           </section>
           <section class="panel">
             <div class="panel-head">
@@ -395,8 +619,16 @@
                 <span>发送交易后先观察内存池数量，再挖矿打包。</span>
               </div>
               <div>
-                <strong>区块广播</strong>
-                <span>某个节点挖到块后，其他节点高度应逐步同步。</span>
+                <strong>区块广播与分叉自愈</strong>
+                <span>两个节点同时挖到同一高度时，累计工作量更大的那条链会赢，落后的节点会自动同步过去。</span>
+              </div>
+              <div>
+                <strong>挖矿奖励的成熟期</strong>
+                <span>刚挖到的奖励算在余额里但不可用，要等若干个区块盖在上面才能花。</span>
+              </div>
+              <div>
+                <strong>减半与总量上限</strong>
+                <span>看“图表”页的累计发行量曲线：奖励每隔固定区块数减半，总量收敛到一个上限。</span>
               </div>
               <div>
                 <strong>参数一致性</strong>
@@ -407,23 +639,30 @@
         </div>
       </section>
 
-      <section class="tab-panel" id="tab-security">
+      <!-- ------------------------------------------------------ 安全 -->
+      <section class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-security" id="tab-security" tabindex="0" hidden>
         <section class="panel">
           <div class="panel-head">
             <h2>安全告警</h2>
-            <button class="ghost-btn" id="refreshSecurityBtn" type="button">刷新告警</button>
+            <div class="button-row">
+              <input class="filter-input" id="securityFilter" type="search" placeholder="过滤类型或节点" aria-label="过滤告警">
+              <button class="ghost-btn" id="exportSecurityBtn" type="button">导出 CSV</button>
+              <button class="ghost-btn" id="refreshSecurityBtn" type="button">刷新告警</button>
+            </div>
           </div>
           <div class="table-wrap">
             <table>
+              <caption class="sr-only">被拒绝的交易、区块与异常同步</caption>
               <thead>
                 <tr>
-                  <th>时间</th>
-                  <th>类型</th>
-                  <th>节点</th>
-                  <th>IP:Port</th>
-                  <th>钱包地址</th>
-                  <th>对象</th>
-                  <th>原因</th>
+                  <th scope="col">时间</th>
+                  <th scope="col">类型</th>
+                  <th scope="col">节点</th>
+                  <th scope="col">IP:Port</th>
+                  <th scope="col">钱包地址</th>
+                  <th scope="col">对象</th>
+                  <th scope="col">原因</th>
+                  <th scope="col">操作</th>
                 </tr>
               </thead>
               <tbody id="securityTable"></tbody>
@@ -432,11 +671,16 @@
         </section>
       </section>
 
-      <section class="tab-panel admin-only" id="tab-classroom" hidden>
+      <!-- ------------------------------------------------------ 教师 -->
+      <section class="tab-panel admin-only" role="tabpanel" aria-labelledby="tabbtn-classroom" id="tab-classroom" tabindex="0" hidden>
         <section class="panel">
           <div class="panel-head">
             <h2>教师总览</h2>
             <div class="button-row">
+              <label class="toggle">
+                <input type="checkbox" id="classroomAutoRefresh" checked>
+                <span>自动刷新</span>
+              </label>
               <button class="ghost-btn" id="refreshClassroomBtn" type="button">刷新课堂</button>
               <button class="primary-btn" id="syncClassroomBtn" type="button">同步区块</button>
             </div>
@@ -462,16 +706,17 @@
           <div class="classroom-alert" id="classroomAlert" hidden></div>
           <div class="table-wrap">
             <table>
+              <caption class="sr-only">课堂内所有节点的状态</caption>
               <thead>
                 <tr>
-                  <th>节点</th>
-                  <th>IP:Port</th>
-                  <th>高度</th>
-                  <th>目标</th>
-                  <th>挖矿</th>
-                  <th>状态</th>
-                  <th>参数 Hash</th>
-                  <th>说明</th>
+                  <th scope="col">节点</th>
+                  <th scope="col">IP:Port</th>
+                  <th scope="col">高度</th>
+                  <th scope="col">目标</th>
+                  <th scope="col">挖矿</th>
+                  <th scope="col">状态</th>
+                  <th scope="col">参数 Hash</th>
+                  <th scope="col">说明</th>
                 </tr>
               </thead>
               <tbody id="classroomTable"></tbody>
@@ -483,6 +728,8 @@
   </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div class="toast error" id="errorToast" role="alert" aria-live="assertive"></div>
+  <script src="/static/qrcode.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

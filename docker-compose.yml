@@ -1,0 +1,35 @@
+# Three nodes on one machine, already peered, for demonstrating a classroom
+# network without needing three computers:
+#
+#   docker compose up
+#   open http://127.0.0.1:8000  (also :8001 and :8002)
+#
+# Each node prints its admin token on startup; writes from another machine
+# need it, writes from the node's own console do not.
+
+services:
+  seed:
+    build: .
+    ports: ["8000:8000", "7464:7464"]
+    volumes: ["./data/seed:/app/data"]
+    environment: [BTCSIM_NODE=seed]
+
+  node2:
+    build: .
+    depends_on: [seed]
+    ports: ["8001:8000", "7465:7464"]
+    volumes: ["./data/node2:/app/data"]
+    command: >
+      sh -c "python scripts/init_node.py --name node2 --config /app/config.json
+             --listen-ip 0.0.0.0 --web-host 0.0.0.0 --peer seed:7464 --no-prompt &&
+             python main.py --config /app/config.json"
+
+  node3:
+    build: .
+    depends_on: [seed]
+    ports: ["8002:8000", "7466:7464"]
+    volumes: ["./data/node3:/app/data"]
+    command: >
+      sh -c "python scripts/init_node.py --name node3 --config /app/config.json
+             --listen-ip 0.0.0.0 --web-host 0.0.0.0 --peer seed:7464 --no-prompt &&
+             python main.py --config /app/config.json"
