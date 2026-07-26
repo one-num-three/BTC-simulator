@@ -109,7 +109,11 @@
 ### 工程
 
 - GitHub Actions CI：Python 3.10 / 3.11 / 3.12 上跑 ruff 与 pytest，
-  外加一个启动并挖矿的冒烟测试。
+  外加一个冒烟任务：把 `main.py` 当子进程真正起起来、用标准库 HTTP 跟它对话，
+  挖块、发交易、验 Merkle 证明、验鉴权。
+  这个任务**只安装 `requirements.txt`**，因此它同时验证了「跑一个节点不需要任何测试依赖」。
+- 新增 `requirements-dev.txt`（`httpx` + `ruff`）。
+  `httpx` 是 `fastapi.testclient` 的依赖，只有跑测试才需要。
 - 测试从 34 个增加到 170 个，覆盖共识、发行、成熟期、Merkle 证明、
   内存池策略、真实区块头序列化、HTTP 鉴权、前端安全静态检查，以及**双节点真实 socket 集成测试**
   ——分叉自愈这类问题只有在两个节点交互时才会出现。

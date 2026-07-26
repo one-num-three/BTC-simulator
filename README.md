@@ -276,11 +276,18 @@ docker run --rm -p 8000:8000 -p 7464:7464 -v "$PWD/data:/app/data" btc-simulator
 ## 开发
 
 ```bash
-python -m pip install -r requirements.txt httpx ruff
+python -m pip install -r requirements-dev.txt
 python -m pytest tests -q      # 170 个测试
 python -m ruff check app tests scripts main.py
-python scripts/smoke_test.py   # 起节点、挖块、发交易的端到端检查
+python scripts/smoke_test.py   # 起真节点、挖块、发交易的端到端检查
 ```
+
+`requirements.txt` 是跑一个节点需要的全部依赖。
+`requirements-dev.txt` 额外装 `httpx`（`fastapi.testclient` 需要）和 `ruff`。
+
+`scripts/smoke_test.py` 刻意只用标准库：它把 `main.py` 当子进程真正起起来、
+用 HTTP 跟它说话，所以它验证的是「只装 `requirements.txt` 能不能跑」，
+覆盖的是真实入口（uvicorn、lifespan、启动横幅），而不是测试替身。
 
 测试分层：
 
