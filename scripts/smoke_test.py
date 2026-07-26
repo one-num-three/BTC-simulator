@@ -83,7 +83,10 @@ def main() -> None:
             check("mining starts", started.status_code == 200)
 
             deadline = time.time() + MINING_TIMEOUT_SECONDS
-            while service.blockchain.height() < 2 and time.time() < deadline:
+            while (
+                service.blockchain.height() < int(config["halving_interval"])
+                and time.time() < deadline
+            ):
                 time.sleep(0.2)
             client.post("/api/mining/stop", headers=headers)
             height = service.blockchain.height()
