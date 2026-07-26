@@ -277,7 +277,7 @@ docker run --rm -p 8000:8000 -p 7464:7464 -v "$PWD/data:/app/data" btc-simulator
 
 ```bash
 python -m pip install -r requirements.txt httpx ruff
-python -m pytest tests -q      # 149 个测试
+python -m pytest tests -q      # 170 个测试
 python -m ruff check app tests scripts main.py
 python scripts/smoke_test.py   # 起节点、挖块、发交易的端到端检查
 ```
@@ -293,6 +293,7 @@ python scripts/smoke_test.py   # 起节点、挖块、发交易的端到端检�
 | `test_mempool_policy.py` | 费率淘汰、RBF、过期、最低中继费 |
 | `test_api.py` | HTTP 鉴权、查询接口、WebSocket 增量推送 |
 | `test_two_node_network.py` | **两个真实节点跑在真实 socket 上**：同步、挖矿竞争后自愈、参数不匹配拒绝、封禁 |
+| `test_btc_format.py` | 真实 80 字节区块头与 nBits，用比特币创世块做基准 |
 | `test_frontend_safety.py` | 静态防回归：禁止 innerHTML 拼接、二维码必须是真编码器 |
 | `test_network_address.py` / `test_init_node.py` | IPv4/IPv6 地址处理与初始化脚本 |
 
