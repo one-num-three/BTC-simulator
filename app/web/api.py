@@ -93,6 +93,10 @@ def create_web_app(service: NodeService) -> FastAPI:
     async def index() -> FileResponse:
         return FileResponse(static_dir / "index.html")
 
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon() -> FileResponse:
+        return FileResponse(static_dir / "favicon.svg", media_type="image/svg+xml")
+
     @app.get("/api/session")
     async def session(request: Request) -> dict[str, Any]:
         """Whether this browser may change the node.

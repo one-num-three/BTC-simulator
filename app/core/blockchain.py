@@ -438,9 +438,9 @@ class Blockchain:
         if int(header["timestamp"]) > now + 2 * 60 * 60:
             raise ValueError("block timestamp is too far in the future")
         floor = self.median_time_past()
-        if floor is not None and int(header["timestamp"]) <= floor:
+        if floor is not None and int(header["timestamp"]) < floor:
             raise ValueError(
-                "block timestamp must be greater than the median of the last "
+                "block timestamp must not be older than the median of the last "
                 f"{MEDIAN_TIME_SPAN} blocks ({floor})"
             )
         return block_hash
@@ -574,9 +574,9 @@ class Blockchain:
             if timestamp > now + 2 * 60 * 60:
                 raise ValueError(f"block {height} timestamp is too far in the future")
             floor = median_time_past(timestamps)
-            if floor is not None and timestamp <= floor:
+            if floor is not None and timestamp < floor:
                 raise ValueError(
-                    f"block {height} timestamp {timestamp} is not greater than "
+                    f"block {height} timestamp {timestamp} is older than "
                     f"the median time past ({floor})"
                 )
             timestamps.append(timestamp)
@@ -744,14 +744,9 @@ class Blockchain:
         )
 
     def next_block_timestamp(self) -> int:
-        """Wall clock, but never at or below the median time past.
-
-        Bitcoin Core does the same thing. It matters more here: a classroom
-        chain can produce several blocks inside one second, and without the
-        bump those blocks would fail their own median-time-past check.
-        """
+        """Wall clock, but never older than the median time past."""
         now = int(time.time())
         floor = self.median_time_past()
         if floor is None:
             return now
-        return max(now, int(floor) + 1)
+        return max(now, int(floor))

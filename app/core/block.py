@@ -159,10 +159,20 @@ MEDIAN_TIME_SPAN = 11
 def median_time_past(timestamps: list[int]) -> int | None:
     """Median of the last ``MEDIAN_TIME_SPAN`` block timestamps.
 
-    Bitcoin requires a new block's timestamp to be strictly greater than this
-    value. Without it a miner can back-date blocks to shrink the measured span
-    of a retarget window and drive difficulty up (or forward-date to drive it
-    down), because the retarget only looks at the first and last timestamp.
+    A block's timestamp must not be *older* than this value. Without such a
+    floor a miner can back-date blocks to shrink the measured span of a
+    retarget window and steer difficulty, because the retarget only looks at
+    the first and last timestamp of the window.
+
+    Bitcoin requires strictly greater. This simulator requires greater *or
+    equal*, on purpose. Bitcoin's blocks are ten minutes apart so the
+    distinction never bites; a classroom chain at low difficulty can mine
+    hundreds of blocks per second, and a strict rule makes the timestamp
+    ratchet forward one second per few blocks whether or not any real time has
+    passed. Left alone that drifts the chain hours into the future and the node
+    starts rejecting its own blocks under the two-hour future limit. Allowing
+    equality removes the ratchet and keeps the anti-back-dating property: the
+    span of a window still cannot be shrunk below what honest clocks produce.
     """
     recent = [int(value) for value in timestamps[-MEDIAN_TIME_SPAN:]]
     if not recent:

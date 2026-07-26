@@ -439,7 +439,7 @@ class NodeService:
             if block:
                 return {"query": term, "kind": "block", "block": block}
 
-        tx = self.store.get_transaction(term) or self.store.get_mempool_transaction(term)
+        tx = self.transaction_detail(term)
         if tx:
             return {"query": term, "kind": "transaction", "transaction": tx}
 

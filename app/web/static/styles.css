@@ -1,5 +1,5 @@
 :root {
-  color-scheme: light;
+  color-scheme: light dark;
   --bg: #f5f6f8;
   --surface: #ffffff;
   --surface-2: #eef1f3;
@@ -122,7 +122,7 @@ h2 {
 }
 
 .ghost-btn {
-  background: #fff;
+  background: var(--surface);
   border: 1px solid var(--line);
   color: var(--text);
 }
@@ -411,7 +411,7 @@ input {
 }
 
 input {
-  background: #fff;
+  background: var(--surface);
 }
 
 input:focus {
@@ -517,9 +517,11 @@ code {
 }
 
 .qr-box canvas {
-  width: 164px;
-  height: 164px;
-  background: #fff;
+  width: 100%;
+  max-width: 220px;
+  height: auto;
+  aspect-ratio: 1 / 1;
+  background: var(--surface);
   border: 1px solid var(--line);
 }
 
@@ -558,7 +560,7 @@ code {
   min-height: 28px;
   padding: 0 9px;
   border-radius: 999px;
-  background: #fff;
+  background: var(--surface);
   color: var(--muted);
   font-size: 12px;
   font-weight: 800;
@@ -650,7 +652,7 @@ table {
   width: 100%;
   min-width: 820px;
   border-collapse: collapse;
-  background: #fff;
+  background: var(--surface);
 }
 
 th,
@@ -744,5 +746,397 @@ td {
   *::before,
   *::after {
     transition: none !important;
+  }
+}
+
+/* ==========================================================================
+   Additions: dark mode, charts, accessibility, small screens
+   ========================================================================== */
+
+/* --- dark mode -----------------------------------------------------------
+   The design tokens were already variables, so the whole theme is a variable
+   swap. `data-theme` (set by the console's toggle) wins over the media query
+   so an explicit choice survives a system change.                          */
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111614;
+    --surface: #171d1b;
+    --surface-2: #1f2624;
+    --text: #e6ecea;
+    --muted: #98a7a3;
+    --line: #2c3634;
+    --primary: #35a894;
+    --primary-dark: #4cc0aa;
+    --primary-soft: #17322d;
+    --accent: #e0913f;
+    --accent-soft: #33261a;
+    --danger: #d3607f;
+    --danger-dark: #e5789a;
+    --danger-soft: #33191f;
+    --shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #111614;
+  --surface: #171d1b;
+  --surface-2: #1f2624;
+  --text: #e6ecea;
+  --muted: #98a7a3;
+  --line: #2c3634;
+  --primary: #35a894;
+  --primary-dark: #4cc0aa;
+  --primary-soft: #17322d;
+  --accent: #e0913f;
+  --accent-soft: #33261a;
+  --danger: #d3607f;
+  --danger-dark: #e5789a;
+  --danger-soft: #33191f;
+  --shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+}
+
+/* Aliases the canvas charts read via getComputedStyle. */
+body {
+  --ink: var(--text);
+  --border: var(--line);
+  /* Second chart series. Must differ from --accent: they were aliased to the
+     same value, so the stacked reward/fee bars rendered as one colour. */
+  --warn: var(--primary);
+}
+
+/* --- accessibility ------------------------------------------------------- */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  left: -999px;
+  top: 0;
+  z-index: 100;
+  padding: 10px 16px;
+  background: var(--primary);
+  color: #fff;
+  border-radius: 0 0 var(--radius) 0;
+}
+
+.skip-link:focus {
+  left: 0;
+}
+
+/* There was exactly one focus outline in the whole stylesheet (on inputs), so
+   every button and clickable row was invisible to keyboard users.           */
+:where(button, [role="button"], a, [tabindex]):focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.clickable-row:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+/* --- controls ------------------------------------------------------------ */
+
+.link-btn {
+  background: none;
+  border: 0;
+  padding: 0 2px;
+  color: var(--primary);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+.link-btn:hover {
+  color: var(--primary-dark);
+}
+
+.link-btn.danger {
+  color: var(--danger);
+}
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.icon-btn {
+  min-width: 38px;
+  padding-inline: 10px;
+}
+
+.filter-input {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  max-width: 180px;
+  padding: 6px 10px;
+}
+
+.toggle {
+  align-items: center;
+  color: var(--muted);
+  display: inline-flex;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.conn-pill {
+  align-self: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 12px;
+  white-space: nowrap;
+}
+
+.conn-pill[data-state="online"] {
+  background: var(--primary-soft);
+  border-color: transparent;
+  color: var(--primary-dark);
+}
+
+.conn-pill[data-state="offline"] {
+  background: var(--danger-soft);
+  border-color: transparent;
+  color: var(--danger);
+}
+
+.copyable {
+  cursor: pointer;
+}
+
+.copyable:hover {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+/* --- summary chips and charts -------------------------------------------- */
+
+.summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.summary-chip {
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 120px;
+  padding: 8px 12px;
+}
+
+.summary-chip span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.summary-chip strong {
+  font-size: 15px;
+}
+
+.chart-grid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+.chart-card {
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  margin: 0;
+  padding: 14px;
+}
+
+.chart-card figcaption {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.chart-card canvas {
+  background: var(--surface);
+  border-radius: 4px;
+  display: block;
+  height: auto;
+  max-width: 100%;
+  width: 100%;
+}
+
+.chart-note {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 8px 0 0;
+}
+
+/* --- merkle proof, receipts, search -------------------------------------- */
+
+.proof-box,
+.receipt,
+.search-result {
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  margin-top: 16px;
+  padding: 14px;
+}
+
+.search-result p {
+  margin: 4px 0;
+}
+
+.proof-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.proof-steps li {
+  align-items: center;
+  background: var(--surface);
+  border-radius: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+}
+
+.proof-index {
+  color: var(--muted);
+  font-size: 12px;
+  min-width: 52px;
+}
+
+.proof-arrow {
+  color: var(--muted);
+}
+
+.warn-text {
+  color: var(--danger);
+  font-size: 13px;
+  margin: 6px 0 12px;
+}
+
+.admin-hint,
+.form-hint {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+  margin: 12px 0 0;
+}
+
+.key-tools {
+  border-top: 1px solid var(--line);
+  margin-top: 18px;
+  padding-top: 14px;
+}
+
+.pager {
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+tr.pending-row td {
+  color: var(--accent);
+}
+
+tr.active td {
+  background: var(--primary-soft);
+}
+
+.qr-box.compact canvas {
+  margin: 0 auto;
+}
+
+/* --- error toast ---------------------------------------------------------- */
+
+.toast.error {
+  background: var(--danger);
+  bottom: 84px;
+  color: #fff;
+}
+
+/* --- small screens --------------------------------------------------------
+   The tab strip had no wrap and no horizontal scroll, so eleven tabs simply
+   overflowed the viewport on a phone.                                       */
+
+.tabs {
+  flex-wrap: wrap;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+@media (max-width: 720px) {
+  body {
+    font-size: 14px;
+  }
+
+  .app-shell {
+    padding: 12px;
+  }
+
+  .tabs {
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .tab {
+    flex: 0 0 auto;
+  }
+
+  .top-actions {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .chart-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .summary-chip {
+    flex: 1 1 44%;
+    min-width: 0;
+  }
+
+  .table-wrap table {
+    min-width: 640px;
+  }
+
+  .block-search {
+    flex-direction: column;
+  }
+
+  .block-search input,
+  .block-search button {
+    width: 100%;
+  }
+
+  .filter-input {
+    max-width: none;
+    width: 100%;
   }
 }

@@ -263,7 +263,7 @@ def test_block_with_backdated_timestamp_is_rejected(tmp_path: Path):
     assert floor is not None
 
     stale = chain.create_candidate_block(wallet.address, [])
-    stale["header"]["timestamp"] = floor  # exactly at the floor is not enough
+    stale["header"]["timestamp"] = floor - 1  # one second below the floor
     nonce = 0
     while True:
         stale["header"]["nonce"] = nonce
@@ -276,7 +276,7 @@ def test_block_with_backdated_timestamp_is_rejected(tmp_path: Path):
     assert "median" in message
 
 
-def test_candidate_timestamp_is_bumped_above_the_median(tmp_path: Path):
+def test_candidate_timestamp_is_never_older_than_the_median(tmp_path: Path):
     """Fast classroom blocks must not fail their own timestamp rule."""
     _config, _store, chain = make_chain(tmp_path)
     wallet = generate_wallet("miner")
@@ -289,7 +289,29 @@ def test_candidate_timestamp_is_bumped_above_the_median(tmp_path: Path):
     floor = chain.median_time_past()
     assert floor is not None
     candidate = chain.create_candidate_block(wallet.address, [])
-    assert int(candidate["header"]["timestamp"]) > floor
+    assert int(candidate["header"]["timestamp"]) >= floor
+
+
+def test_fast_mining_does_not_ratchet_timestamps_into_the_future(tmp_path: Path):
+    """Regression: a strictly-greater MTP rule drifts a fast chain forward.
+
+    With `timestamp > median` the miner has to add a second whenever the median
+    catches up, whether or not real time moved. At the hundreds-of-blocks-per-
+    second a difficulty-1 classroom chain reaches, that walked the chain hours
+    into the future within minutes -- and then the two-hour future-block limit
+    started rejecting the node's own blocks.
+    """
+    _config, _store, chain = make_chain(tmp_path, difficulty=0)
+    wallet = generate_wallet("miner")
+    start = int(time.time())
+
+    for _ in range(400):
+        block, _ = mine_block(chain, wallet.address)
+        assert chain.add_block(block)[0]
+
+    drift = int(chain.tip()["timestamp"]) - int(time.time())
+    assert drift <= 2, f"timestamps drifted {drift}s ahead of the wall clock"
+    assert int(chain.tip()["timestamp"]) >= start
 
 
 # --------------------------------------------------------------------------
