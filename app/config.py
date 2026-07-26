@@ -8,11 +8,12 @@ import string
 from pathlib import Path
 from typing import Any
 
+from app import __version__
 from app.utils.crypto import hash_json
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "version": "0.1.0",
+    "version": __version__,
     "network_id": "btc-sim-classroom",
     "node_name": "server1",
     "listen_ip": "0.0.0.0",

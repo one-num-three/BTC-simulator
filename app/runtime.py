@@ -6,7 +6,12 @@ import time
 from collections import deque
 from typing import Any
 
-from app.config import network_identity, resolve_project_path, save_config
+from app.config import (
+    DEFAULT_CONFIG,
+    network_identity,
+    resolve_project_path,
+    save_config,
+)
 from app.core.block import target_preview
 from app.core.blockchain import Blockchain
 from app.core.mempool import Mempool
@@ -22,6 +27,7 @@ from app.network.address import (
     parse_host_port,
 )
 from app.network.node import P2PNode
+from app.status import PeerStatus
 from app.storage.sqlite_store import SQLiteStore
 
 
@@ -50,6 +56,11 @@ class NodeService:
         self.mempool = Mempool(self.store, self.blockchain, self.log)
         self.p2p = P2PNode(config, self, self.log)
         self.miner = Miner(self.blockchain, self.mempool, self.log, self._on_mined_block)
+        self._sync_task: asyncio.Task[None] | None = None
+
+    @property
+    def sync_interval_seconds(self) -> int:
+        return max(int(self.config.get("sync_interval_seconds", 10)), 1)
 
     def log(self, message: str) -> None:
         self.events.add(message)
@@ -86,8 +97,18 @@ class NodeService:
         self.log(f"Security alert: {message}")
 
     def _route_ip(self, family: socket.AddressFamily, target: str) -> str | None:
-        sock = socket.socket(family, socket.SOCK_DGRAM)
+        """Best-effort "which local address would I use to reach X".
+
+        The socket is created *inside* the try on purpose: on a host with no
+        IPv6 stack (CI containers, some school networks, IPv6 disabled in the
+        kernel) ``socket.socket(AF_INET6, ...)`` itself raises ``OSError:
+        Address family not supported by protocol``. That used to escape and
+        take down every caller of ``network_info()`` -- which is the join page,
+        the status endpoint and the teacher page.
+        """
+        sock: socket.socket | None = None
         try:
+            sock = socket.socket(family, socket.SOCK_DGRAM)
             if family == socket.AF_INET6:
                 sock.connect((target, 80, 0, 0))
             else:
@@ -96,7 +117,8 @@ class NodeService:
         except OSError:
             return None
         finally:
-            sock.close()
+            if sock is not None:
+                sock.close()
 
     def _lan_ip(self) -> str:
         return self._route_ip(socket.AF_INET, "8.8.8.8") or "127.0.0.1"
@@ -115,11 +137,43 @@ class NodeService:
 
     async def start(self) -> None:
         await self.p2p.start()
+        self._sync_task = asyncio.create_task(self._sync_loop(), name="btc-sim-sync")
 
     async def shutdown(self) -> None:
+        if self._sync_task is not None:
+            self._sync_task.cancel()
+            try:
+                await self._sync_task
+            except BaseException:
+                pass
+            self._sync_task = None
         await self.miner.stop()
         await self.p2p.stop()
         self.store.close()
+
+    async def _sync_loop(self) -> None:
+        """Keep the node converging without anyone pressing a button.
+
+        ``sync_interval_seconds`` has been in every config file since the first
+        commit but nothing ever read it, so a node that lost a mining race or
+        missed a broadcast stayed behind until a human clicked "sync". Each tick
+        does three cheap things: ping live peers so ``last_seen`` stays honest,
+        retry peers we know but are not connected to, and pull the chain from
+        any peer reporting more cumulative work than us.
+        """
+        interval = self.sync_interval_seconds
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self.p2p.ping_peers()
+                await self.p2p.reconnect_known_peers()
+                pulled = await self.p2p.request_blocks_from_better_peers()
+                if pulled:
+                    self.log(f"Auto-sync requested chain from {pulled} peer(s)")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # never let one bad tick kill the loop
+                self.log(f"Auto-sync tick failed: {exc}")
 
     async def _on_mined_block(self, block: dict[str, Any], block_hash: str) -> None:
         await self.p2p.broadcast_block(block)
@@ -200,8 +254,8 @@ class NodeService:
 
     async def set_difficulty(self, difficulty: int) -> dict[str, Any]:
         difficulty = int(difficulty)
-        minimum = int(self.config.get("min_difficulty", 0))
-        maximum = int(self.config.get("max_difficulty", 12))
+        minimum = int(self.config.get("min_difficulty", DEFAULT_CONFIG["min_difficulty"]))
+        maximum = int(self.config.get("max_difficulty", DEFAULT_CONFIG["max_difficulty"]))
         if difficulty < minimum or difficulty > maximum:
             raise ValueError(f"difficulty must be between {minimum} and {maximum}")
         was_mining = self.miner.is_mining
@@ -309,7 +363,7 @@ class NodeService:
             "ip": network["advertised_ip"],
             "port": network["listen_port"],
             "address": status["wallet"]["address"],
-            "status": "本机",
+            "status": PeerStatus.SELF,
             "direction": "self",
             "height": status["height"],
             "difficulty": status["difficulty"],
@@ -323,7 +377,7 @@ class NodeService:
         peers = self.store.list_peers()
         mismatches = [
             peer for peer in peers
-            if peer.get("status") == "参数不匹配"
+            if peer.get("status") == PeerStatus.PARAM_MISMATCH
             or "mismatch" in str(peer.get("mismatch_reason") or "")
         ]
         return {
@@ -361,6 +415,9 @@ class NodeService:
             "height": int(tip["height"]),
             "tip_hash": tip["hash"],
             "last_block_time": int(tip["timestamp"]),
+            "chain_work": str(self.blockchain.chain_work()),
+            "median_time_past": self.blockchain.median_time_past(),
+            "orphan_count": len(self.blockchain.orphans),
             "difficulty": self.blockchain.expected_difficulty(),
             "target": target,
             "target_preview": target_preview(target),

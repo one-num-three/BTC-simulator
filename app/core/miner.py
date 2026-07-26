@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 from app.core.block import compute_block_hash, hash_meets_difficulty, hash_meets_target
 from app.core.blockchain import Blockchain
 from app.core.mempool import Mempool
+from app.status import MinerStatus
 
 LogFn = Callable[[str], None]
 BlockCallback = Callable[[dict[str, Any], str], Awaitable[None] | None]
@@ -28,7 +29,7 @@ class Miner:
         self._stop_event = asyncio.Event()
         self.current_nonce = 0
         self.current_hash = ""
-        self.status = "未挖矿"
+        self.status = MinerStatus.IDLE
 
     @property
     def is_mining(self) -> bool:
@@ -38,13 +39,13 @@ class Miner:
         if self.is_mining:
             return False
         self._stop_event = asyncio.Event()
-        self.status = "正在挖矿"
+        self.status = MinerStatus.MINING
         self._task = asyncio.create_task(self._mine_forever(), name="btc-sim-miner")
         return True
 
     async def stop(self) -> bool:
         if not self.is_mining:
-            self.status = "暂停"
+            self.status = MinerStatus.PAUSED
             return False
         self._stop_event.set()
         if self._task:
@@ -52,7 +53,7 @@ class Miner:
                 await asyncio.wait_for(self._task, timeout=3)
             except asyncio.TimeoutError:
                 self._task.cancel()
-        self.status = "暂停"
+        self.status = MinerStatus.PAUSED
         self.log("Mining paused")
         return True
 
@@ -66,11 +67,11 @@ class Miner:
     async def _mine_forever(self) -> None:
         wallet = self.blockchain.store.get_default_wallet()
         if not wallet:
-            self.status = "未挖矿"
+            self.status = MinerStatus.IDLE
             self.log("Mining failed: no wallet")
             return
 
-        self.status = "正在挖矿"
+        self.status = MinerStatus.MINING
         self.log("Mining started")
         max_transfers = max(int(self.blockchain.config["max_block_transactions"]) - 1, 0)
 
@@ -87,6 +88,15 @@ class Miner:
                         break
                     block["header"]["nonce"] = nonce
                     block_hash = compute_block_hash(block)
+                    # INTENTIONAL, DO NOT "OPTIMISE" AWAY.
+                    #
+                    # This throttles the miner to roughly 1000 hashes/second so
+                    # that students can watch the nonce climb and the candidate
+                    # hash change one attempt at a time. Removing it makes the
+                    # node ~200x faster and the teaching display unreadable.
+                    #
+                    # The `nonce % 1000` yield further down is the scheduler
+                    # fairness hatch; this line is the pedagogical pacing.
                     await asyncio.sleep(0.001)
                     self.current_nonce = nonce
                     self.current_hash = block_hash
@@ -111,4 +121,4 @@ class Miner:
                     if nonce % 1000 == 0:
                         await asyncio.sleep(0)
         finally:
-            self.status = "暂停" if self._stop_event.is_set() else "未挖矿"
+            self.status = MinerStatus.PAUSED if self._stop_event.is_set() else MinerStatus.IDLE

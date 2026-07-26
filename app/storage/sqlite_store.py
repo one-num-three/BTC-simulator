@@ -6,7 +6,15 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from app.core.block import (
+    MEDIAN_TIME_SPAN,
+    format_work,
+    header_work,
+    median_time_past,
+    parse_work,
+)
 from app.core.transaction import estimate_transaction_bytes
+from app.status import LEGACY_PEER_STATUS
 
 
 class SQLiteStore:
@@ -48,6 +56,7 @@ class SQLiteStore:
                     target TEXT,
                     nonce INTEGER NOT NULL,
                     version INTEGER NOT NULL,
+                    chain_work TEXT,
                     block_json TEXT NOT NULL
                 );
 
@@ -85,6 +94,8 @@ class SQLiteStore:
                     network_id TEXT,
                     chain_params_hash TEXT,
                     height INTEGER,
+                    chain_work TEXT,
+                    tip_hash TEXT,
                     difficulty INTEGER,
                     target TEXT,
                     mining_status TEXT,
@@ -98,7 +109,25 @@ class SQLiteStore:
                 "blocks",
                 {
                     "target": "TEXT",
+                    "chain_work": "TEXT",
                 },
+            )
+            # Older databases stored Chinese display labels in peers.status.
+            for legacy, modern in LEGACY_PEER_STATUS.items():
+                self.conn.execute(
+                    "UPDATE peers SET status = ? WHERE status = ?", (modern, legacy)
+                )
+            self.conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_transactions_sender
+                    ON transactions(sender);
+                CREATE INDEX IF NOT EXISTS idx_transactions_receiver
+                    ON transactions(receiver);
+                CREATE INDEX IF NOT EXISTS idx_transactions_block_hash
+                    ON transactions(block_hash);
+                CREATE INDEX IF NOT EXISTS idx_mempool_sender
+                    ON mempool(sender);
+                """
             )
             self._ensure_columns(
                 "peers",
@@ -106,6 +135,8 @@ class SQLiteStore:
                     "network_id": "TEXT",
                     "chain_params_hash": "TEXT",
                     "height": "INTEGER",
+                    "chain_work": "TEXT",
+                    "tip_hash": "TEXT",
                     "difficulty": "INTEGER",
                     "target": "TEXT",
                     "mining_status": "TEXT",
@@ -176,11 +207,20 @@ class SQLiteStore:
     def insert_block(self, height: int, block_hash: str, block: dict[str, Any]) -> None:
         header = block["header"]
         with self.lock, self.conn:
+            if int(height) == 0:
+                cumulative = 0
+            else:
+                previous = self.conn.execute(
+                    "SELECT chain_work FROM blocks WHERE height = ?", (int(height) - 1,)
+                ).fetchone()
+                cumulative = parse_work(previous["chain_work"] if previous else None)
+                cumulative += header_work(header)
             self.conn.execute(
                 """
                 INSERT INTO blocks
-                (height, hash, prev_hash, merkle_root, timestamp, difficulty, target, nonce, version, block_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (height, hash, prev_hash, merkle_root, timestamp, difficulty, target,
+                 nonce, version, chain_work, block_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     height,
@@ -192,6 +232,7 @@ class SQLiteStore:
                     header.get("target"),
                     header["nonce"],
                     header["version"],
+                    format_work(cumulative),
                     json.dumps(block, ensure_ascii=True, sort_keys=True),
                 ),
             )
@@ -238,6 +279,47 @@ class SQLiteStore:
 
     def has_block_hash(self, block_hash: str) -> bool:
         return self.get_block_by_hash(block_hash) is not None
+
+    def tip_chain_work(self) -> int:
+        """Cumulative work of the stored chain, used by the longest-chain rule."""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT chain_work FROM blocks ORDER BY height DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return 0
+            if row["chain_work"] is not None:
+                return parse_work(row["chain_work"])
+        return self.recompute_chain_work()
+
+    def recompute_chain_work(self) -> int:
+        """Backfill chain_work for databases written before the column existed."""
+        with self.lock, self.conn:
+            rows = self.conn.execute(
+                "SELECT height, block_json FROM blocks ORDER BY height ASC"
+            ).fetchall()
+            cumulative = 0
+            for row in rows:
+                if int(row["height"]) > 0:
+                    header = json.loads(row["block_json"])["header"]
+                    cumulative += header_work(header)
+                self.conn.execute(
+                    "UPDATE blocks SET chain_work = ? WHERE height = ?",
+                    (format_work(cumulative), int(row["height"])),
+                )
+            return cumulative
+
+    def recent_timestamps(self, count: int = MEDIAN_TIME_SPAN) -> list[int]:
+        """Timestamps of the newest ``count`` blocks, oldest first."""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT timestamp FROM blocks ORDER BY height DESC LIMIT ?",
+                (int(count),),
+            ).fetchall()
+        return [int(row["timestamp"]) for row in reversed(rows)]
+
+    def median_time_past(self) -> int | None:
+        return median_time_past(self.recent_timestamps())
 
     def get_block_json_by_hash(self, block_hash: str) -> dict[str, Any] | None:
         row = self.get_block_by_hash(block_hash)
@@ -416,6 +498,8 @@ class SQLiteStore:
         network_id: str | None = None,
         chain_params_hash: str | None = None,
         height: int | None = None,
+        chain_work: str | None = None,
+        tip_hash: str | None = None,
         difficulty: int | None = None,
         target: str | None = None,
         mining_status: str | None = None,
@@ -427,10 +511,10 @@ class SQLiteStore:
                 """
                 INSERT INTO peers (
                     ip, port, name, address, direction, status, last_seen,
-                    network_id, chain_params_hash, height, difficulty,
-                    target, mining_status, web_port, mismatch_reason
+                    network_id, chain_params_hash, height, chain_work, tip_hash,
+                    difficulty, target, mining_status, web_port, mismatch_reason
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ip, port) DO UPDATE SET
                     name = excluded.name,
                     address = excluded.address,
@@ -440,6 +524,8 @@ class SQLiteStore:
                     network_id = excluded.network_id,
                     chain_params_hash = excluded.chain_params_hash,
                     height = excluded.height,
+                    chain_work = excluded.chain_work,
+                    tip_hash = excluded.tip_hash,
                     difficulty = excluded.difficulty,
                     target = excluded.target,
                     mining_status = excluded.mining_status,
@@ -457,6 +543,8 @@ class SQLiteStore:
                     network_id,
                     chain_params_hash,
                     height,
+                    chain_work,
+                    tip_hash,
                     difficulty,
                     target,
                     mining_status,
@@ -470,8 +558,8 @@ class SQLiteStore:
             rows = self.conn.execute(
                 """
                 SELECT ip, port, name, address, direction, status, last_seen,
-                       network_id, chain_params_hash, height, difficulty,
-                       target, mining_status, web_port, mismatch_reason
+                       network_id, chain_params_hash, height, chain_work, tip_hash,
+                       difficulty, target, mining_status, web_port, mismatch_reason
                 FROM peers
                 ORDER BY ip, port
                 """

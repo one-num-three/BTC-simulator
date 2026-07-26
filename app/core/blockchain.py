@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import math
 import time
+from collections import OrderedDict
 from typing import Any, Callable
 
 from app.core.block import (
+    MEDIAN_TIME_SPAN,
+    block_work,
     compute_block_hash,
     create_block,
     difficulty_to_target,
     genesis_block,
     hash_meets_target,
+    header_work,
+    median_time_past,
     normalize_target_hex,
     target_preview,
     target_to_difficulty,
@@ -24,12 +29,19 @@ from app.storage.sqlite_store import SQLiteStore
 
 LogFn = Callable[[str], None]
 
+MAX_ORPHAN_BLOCKS = 64
+DISCONNECTED_BLOCK_REASON = "block does not connect to current tip"
+
 
 class Blockchain:
     def __init__(self, config: dict[str, Any], store: SQLiteStore, log: LogFn | None = None):
         self.config = config
         self.store = store
         self.log = log or (lambda _message: None)
+        # Blocks whose parent we have not seen yet. Without this a node that
+        # loses a mining race drops the winning block on the floor and the
+        # network stays split until somebody clicks "sync" by hand.
+        self.orphans: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.ensure_genesis()
 
     @property
@@ -227,6 +239,45 @@ class Blockchain:
     def tip_hash(self) -> str:
         return str(self.tip()["hash"])
 
+    def chain_work(self) -> int:
+        """Cumulative proof-of-work of the local chain."""
+        return self.store.tip_chain_work()
+
+    def median_time_past(self) -> int | None:
+        """Lower bound a new block's timestamp has to beat."""
+        return self.store.median_time_past()
+
+    def remember_orphan(self, block: dict[str, Any]) -> None:
+        block_hash = compute_block_hash(block)
+        if block_hash in self.orphans:
+            self.orphans.move_to_end(block_hash)
+            return
+        self.orphans[block_hash] = block
+        while len(self.orphans) > MAX_ORPHAN_BLOCKS:
+            self.orphans.popitem(last=False)
+
+    def connect_orphans(self, source: str = "orphan") -> int:
+        """Attach any cached orphans that now connect to the tip.
+
+        Called after every accepted block, so a block that arrived out of order
+        gets stitched on as soon as its parent shows up.
+        """
+        connected = 0
+        progress = True
+        while progress:
+            progress = False
+            tip_hash = self.tip_hash()
+            for block_hash, block in list(self.orphans.items()):
+                if block["header"].get("prev_hash") != tip_hash:
+                    continue
+                self.orphans.pop(block_hash, None)
+                accepted, _result = self.add_block(block, source=source, allow_orphan=False)
+                if accepted:
+                    connected += 1
+                    progress = True
+                break
+        return connected
+
     def get_balance(self, address: str) -> float:
         return self.store.confirmed_balance(address)
 
@@ -292,11 +343,17 @@ class Blockchain:
         if self.store.has_block_hash(block_hash):
             raise ValueError("block already exists")
         if header["prev_hash"] != self.tip_hash():
-            raise ValueError("block does not connect to current tip")
+            raise ValueError(DISCONNECTED_BLOCK_REASON)
 
         now = int(time.time())
         if int(header["timestamp"]) > now + 2 * 60 * 60:
             raise ValueError("block timestamp is too far in the future")
+        floor = self.median_time_past()
+        if floor is not None and int(header["timestamp"]) <= floor:
+            raise ValueError(
+                "block timestamp must be greater than the median of the last "
+                f"{MEDIAN_TIME_SPAN} blocks ({floor})"
+            )
         return block_hash
 
     def validate_block(self, block: dict[str, Any]) -> str:
@@ -372,6 +429,8 @@ class Blockchain:
         block_hashes = [expected_genesis_hash]
         balances: dict[str, float] = {}
         seen_tx_ids: set[str] = set()
+        timestamps: list[int] = [int(expected_genesis["header"]["timestamp"])]
+        now = int(time.time())
 
         for height, block in enumerate(blocks[1:], start=1):
             if "header" not in block or "transactions" not in block:
@@ -403,6 +462,17 @@ class Blockchain:
                 )
             if not hash_meets_target(block_hash, actual_target):
                 raise ValueError(f"block {height} hash does not meet its header target")
+
+            timestamp = int(header["timestamp"])
+            if timestamp > now + 2 * 60 * 60:
+                raise ValueError(f"block {height} timestamp is too far in the future")
+            floor = median_time_past(timestamps)
+            if floor is not None and timestamp <= floor:
+                raise ValueError(
+                    f"block {height} timestamp {timestamp} is not greater than "
+                    f"the median time past ({floor})"
+                )
+            timestamps.append(timestamp)
 
             transactions = block.get("transactions", [])
             if not isinstance(transactions, list):
@@ -457,34 +527,65 @@ class Blockchain:
 
     def replace_with_chain(self, blocks: list[dict[str, Any]], source: str = "sync") -> tuple[bool, str]:
         remote_height = len(blocks) - 1
-        if remote_height <= self.height():
-            return False, "replacement chain is not longer"
+        local_work = self.chain_work()
+
+        # Cheap pre-filter only. The real comparison is on cumulative work and
+        # happens after validation, because an unvalidated chain can claim any
+        # difficulty it likes -- the work is only meaningful once every block
+        # has been shown to actually meet its own target.
+        if remote_height <= 0:
+            return False, "replacement chain has no blocks after genesis"
+
         try:
             block_hashes = self.validate_chain_replacement(blocks)
         except ValueError as exc:
             return False, str(exc)
 
+        remote_work = sum(header_work(block["header"]) for block in blocks[1:])
+        if remote_work < local_work:
+            return False, (
+                f"replacement chain has less work: {remote_work} < {local_work}"
+            )
+        if remote_work == local_work:
+            # Equal work is a tie. Bitcoin keeps whatever it saw first, which
+            # is what makes "first seen wins" the tie-break rule students meet
+            # in the classroom demo.
+            return False, "replacement chain has the same work as the local chain"
+
         self.store.replace_chain(blocks, block_hashes)
+        self.orphans.clear()
         self.log(
             f"Chain replaced from {source}: height {remote_height}, "
-            f"tip {block_hashes[-1][:16]}"
+            f"work {remote_work} > {local_work}, tip {block_hashes[-1][:16]}"
         )
         return True, block_hashes[-1]
 
-    def add_block(self, block: dict[str, Any], source: str = "local") -> tuple[bool, str]:
+    def add_block(
+        self,
+        block: dict[str, Any],
+        source: str = "local",
+        allow_orphan: bool = True,
+    ) -> tuple[bool, str]:
         block_hash = compute_block_hash(block)
         if self.store.has_block_hash(block_hash):
             return False, "block already exists"
         try:
             validated_hash = self.validate_block(block)
         except ValueError as exc:
-            return False, str(exc)
+            reason = str(exc)
+            if allow_orphan and reason == DISCONNECTED_BLOCK_REASON:
+                # Keep it: it is either a competing tip or a block that arrived
+                # before its parent. Either way the caller should now ask the
+                # sender for the chain it belongs to.
+                self.remember_orphan(block)
+            return False, reason
 
         height = self.height() + 1
         self.store.insert_block(height, validated_hash, block)
         confirmed_ids = [tx["tx_id"] for tx in block.get("transactions", []) if tx.get("type") != "coinbase"]
         self.store.remove_mempool_transactions(confirmed_ids)
         self.log(f"Block accepted from {source}: height {height}, hash {validated_hash[:16]}")
+        self.connect_orphans()
         return True, validated_hash
 
     def select_transactions_for_block(self, max_transfers: int) -> list[dict[str, Any]]:
@@ -528,4 +629,18 @@ class Blockchain:
             transactions=[coinbase, *transfers],
             difficulty=target_to_difficulty(target),
             target=target,
+            timestamp=self.next_block_timestamp(),
         )
+
+    def next_block_timestamp(self) -> int:
+        """Wall clock, but never at or below the median time past.
+
+        Bitcoin Core does the same thing. It matters more here: a classroom
+        chain can produce several blocks inside one second, and without the
+        bump those blocks would fail their own median-time-past check.
+        """
+        now = int(time.time())
+        floor = self.median_time_past()
+        if floor is None:
+            return now
+        return max(now, int(floor) + 1)

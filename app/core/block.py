@@ -105,3 +105,67 @@ def target_preview(target: str | int, minimum_chars: int = 8) -> str:
 
 def hash_meets_target(block_hash: str, target: str | int) -> bool:
     return int(block_hash, 16) <= int(normalize_target_hex(target), 16)
+
+
+def block_work(target: str | int) -> int:
+    """Expected number of hashes needed to find one block at this target.
+
+    Bitcoin scores a chain by cumulative work, not by block count. The work of a
+    single block is ``2**256 / (target + 1)``: the fraction of the 256-bit hash
+    space that satisfies it. With the simulator's leading-zero-bit targets
+    (``target = 2**(256-d) - 1``) this reduces to exactly ``2**d``, so a block at
+    difficulty 13 is worth two blocks at difficulty 12.
+
+    This is why the longest-chain rule must compare work and not height: with
+    automatic difficulty a chain of 11 easy blocks is *shorter* in work than a
+    chain of 10 hard ones, even though it has more blocks.
+    """
+    value = int(normalize_target_hex(target), 16)
+    return (1 << 256) // (value + 1)
+
+
+def header_work(header: dict[str, Any]) -> int:
+    """Work of a block header, preferring its explicit target."""
+    target = header.get("target")
+    if target is None:
+        return block_work(difficulty_to_target(int(header.get("difficulty", 0))))
+    return block_work(target)
+
+
+def chain_work_of(blocks: list[dict[str, Any]]) -> int:
+    """Cumulative work of a list of blocks (genesis contributes nothing)."""
+    return sum(header_work(block["header"]) for block in blocks[1:])
+
+
+def format_work(work: int) -> str:
+    """Store cumulative work as fixed-width hex so it sorts as text in SQLite."""
+    return f"{int(work):064x}"
+
+
+def parse_work(value: str | int | None) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return 0
+    return int(text, 16)
+
+
+MEDIAN_TIME_SPAN = 11
+
+
+def median_time_past(timestamps: list[int]) -> int | None:
+    """Median of the last ``MEDIAN_TIME_SPAN`` block timestamps.
+
+    Bitcoin requires a new block's timestamp to be strictly greater than this
+    value. Without it a miner can back-date blocks to shrink the measured span
+    of a retarget window and drive difficulty up (or forward-date to drive it
+    down), because the retarget only looks at the first and last timestamp.
+    """
+    recent = [int(value) for value in timestamps[-MEDIAN_TIME_SPAN:]]
+    if not recent:
+        return None
+    recent.sort()
+    return recent[len(recent) // 2]
