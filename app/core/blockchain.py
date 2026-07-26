@@ -53,6 +53,75 @@ class Blockchain:
         return int(self.config["max_block_transactions"])
 
     @property
+    def halving_interval(self) -> int:
+        return max(int(self.config.get("halving_interval", 20)), 1)
+
+    @property
+    def coinbase_maturity(self) -> int:
+        return max(int(self.config.get("coinbase_maturity", 0)), 0)
+
+    def block_subsidy(self, height: int) -> float:
+        """Newly issued coins at ``height``, halving on a fixed schedule.
+
+        This is the mechanism that gives Bitcoin a fixed supply, and it was the
+        one piece of the design the simulator did not model at all: the reward
+        was a constant read straight from the config, so the chain issued coins
+        forever and "why is there only ever 21 million?" had no answer here.
+        """
+        era = int(height) // self.halving_interval
+        if era >= 64:
+            return 0.0
+        value = float(self.config["mining_reward"]) / float(1 << era)
+        # below one satoshi the subsidy is gone for good
+        return 0.0 if value < 1e-8 else round(value, 8)
+
+    def max_supply(self) -> float:
+        """Total coins this chain will ever issue.
+
+        Each era pays ``halving_interval`` blocks, except that height 0 is the
+        genesis block and carries no coinbase, so the first era is one block
+        short. The result is deliberately not a round number: Bitcoin's cap is
+        20,999,999.9769 rather than 21,000,000 for the same kind of reason.
+        """
+        total = 0.0
+        era = 0
+        while era < 64:
+            subsidy = self.block_subsidy(era * self.halving_interval)
+            if subsidy <= 0:
+                break
+            total += subsidy * self.halving_interval
+            era += 1
+        total -= self.block_subsidy(0)  # genesis pays nothing
+        return round(total, 8)
+
+    def total_issued(self) -> float:
+        return self.store.total_issued()
+
+    def next_halving_height(self) -> int:
+        height = self.height()
+        return ((height // self.halving_interval) + 1) * self.halving_interval
+
+    def supply_policy(self) -> dict[str, Any]:
+        height = self.height()
+        issued = self.total_issued()
+        cap = self.max_supply()
+        return {
+            "halving_interval": self.halving_interval,
+            "coinbase_maturity": self.coinbase_maturity,
+            "era": height // self.halving_interval,
+            # Reward the *next* block will pay, and the reward after the next
+            # halving. Naming them apart avoids the confusion at a boundary
+            # where "current era" and "next block's subsidy" disagree.
+            "next_block_subsidy": self.block_subsidy(height + 1),
+            "subsidy_after_halving": self.block_subsidy(self.next_halving_height()),
+            "next_halving_height": self.next_halving_height(),
+            "blocks_to_halving": max(self.next_halving_height() - height, 0),
+            "total_issued": issued,
+            "max_supply": cap,
+            "issued_ratio": round(issued / cap, 6) if cap else 0.0,
+        }
+
+    @property
     def auto_difficulty(self) -> bool:
         return bool(self.config.get("auto_difficulty", False))
 
@@ -281,9 +350,29 @@ class Blockchain:
     def get_balance(self, address: str) -> float:
         return self.store.confirmed_balance(address)
 
+    def immature_balance(self, address: str, spending_height: int | None = None) -> float:
+        """Mining income that exists on chain but is not spendable yet.
+
+        A coinbase at height H can be spent in a block at height h only once
+        ``h - H >= coinbase_maturity``. Without this rule a reorg can undo the
+        block that paid a miner *after* the miner has already spent the reward,
+        leaving the ledger short.
+        """
+        maturity = self.coinbase_maturity
+        if maturity <= 0:
+            return 0.0
+        height = int(spending_height if spending_height is not None else self.height() + 1)
+        return self.store.immature_coinbase_total(address, height - maturity)
+
+    def spendable_balance(self, address: str, spending_height: int | None = None) -> float:
+        """Confirmed balance minus coinbase that has not matured."""
+        return round(
+            self.get_balance(address) - self.immature_balance(address, spending_height), 8
+        )
+
     def get_available_balance(self, address: str, exclude_tx_id: str | None = None) -> float:
         pending = self.store.pending_outgoing(address, exclude_tx_id=exclude_tx_id)
-        return round(self.get_balance(address) - pending, 8)
+        return round(self.spendable_balance(address) - pending, 8)
 
     def validate_transfer_transaction(
         self,
@@ -303,7 +392,7 @@ class Blockchain:
         if include_mempool:
             available = self.get_available_balance(tx["sender"], exclude_tx_id=tx_id)
         else:
-            available = self.get_balance(tx["sender"])
+            available = self.spendable_balance(tx["sender"])
         if available + 1e-8 < required:
             raise ValueError(f"insufficient available balance: need {required}, have {available}")
 
@@ -384,6 +473,7 @@ class Blockchain:
         seen_tx_ids: set[str] = set()
         temp_balances: dict[str, float] = {}
         total_fees = 0.0
+        block_height = self.height() + 1
         for tx in transactions:
             tx_id = tx["tx_id"]
             if tx_id in seen_tx_ids:
@@ -399,21 +489,26 @@ class Blockchain:
             sender = tx["sender"]
             receiver = tx["receiver"]
             if sender not in temp_balances:
-                temp_balances[sender] = self.get_balance(sender)
+                temp_balances[sender] = self.spendable_balance(sender, block_height)
             if receiver not in temp_balances:
                 temp_balances[receiver] = self.get_balance(receiver)
 
             required = round(float(tx["amount"]) + float(tx["fee"]), 8)
             if temp_balances[sender] + 1e-8 < required:
-                raise ValueError(f"block spends more than available balance for {sender[:16]}")
+                raise ValueError(
+                    f"block spends more than the spendable balance for {sender[:16]} "
+                    "(immature mining rewards cannot be spent yet)"
+                )
             temp_balances[sender] = round(temp_balances[sender] - required, 8)
             temp_balances[receiver] = round(temp_balances[receiver] + float(tx["amount"]), 8)
             total_fees = round(total_fees + float(tx["fee"]), 8)
 
-        expected_coinbase = round(self.mining_reward + total_fees, 8)
+        subsidy = self.block_subsidy(block_height)
+        expected_coinbase = round(subsidy + total_fees, 8)
         if not math.isclose(float(coinbase["amount"]), expected_coinbase, abs_tol=1e-8):
             raise ValueError(
-                f"coinbase amount must equal reward plus fees: expected {expected_coinbase}"
+                f"coinbase amount must equal subsidy plus fees: expected {expected_coinbase} "
+                f"(subsidy {subsidy} at height {block_height} + fees {total_fees})"
             )
         return block_hash
 
@@ -431,8 +526,20 @@ class Blockchain:
         seen_tx_ids: set[str] = set()
         timestamps: list[int] = [int(expected_genesis["header"]["timestamp"])]
         now = int(time.time())
+        maturity = self.coinbase_maturity
+        # Coinbase outputs waiting to mature: (mined_height, receiver, amount).
+        locked_coinbases: list[tuple[int, str, float]] = []
 
         for height, block in enumerate(blocks[1:], start=1):
+            # Release any mining reward that is now buried deep enough to spend.
+            still_locked: list[tuple[int, str, float]] = []
+            for mined_height, receiver, amount in locked_coinbases:
+                if height - mined_height >= maturity:
+                    balances[receiver] = round(balances.get(receiver, 0.0) + amount, 8)
+                else:
+                    still_locked.append((mined_height, receiver, amount))
+            locked_coinbases = still_locked
+
             if "header" not in block or "transactions" not in block:
                 raise ValueError(f"block {height} must contain header and transactions")
             header = block["header"]
@@ -510,13 +617,17 @@ class Blockchain:
                 balance_delta[receiver] = round(balance_delta.get(receiver, 0.0) + float(tx["amount"]), 8)
                 total_fees = round(total_fees + float(tx["fee"]), 8)
 
-            expected_coinbase = round(self.mining_reward + total_fees, 8)
+            expected_coinbase = round(self.block_subsidy(height) + total_fees, 8)
             if not math.isclose(float(coinbase["amount"]), expected_coinbase, abs_tol=1e-8):
-                raise ValueError(f"block {height} coinbase amount is invalid")
+                raise ValueError(
+                    f"block {height} coinbase amount is invalid: "
+                    f"expected {expected_coinbase}, got {coinbase['amount']}"
+                )
             seen_tx_ids.add(coinbase["tx_id"])
-            balance_delta[coinbase["receiver"]] = round(
-                balance_delta.get(coinbase["receiver"], 0.0) + float(coinbase["amount"]),
-                8,
+            # The reward is NOT credited here: it only becomes spendable once
+            # `coinbase_maturity` further blocks are on top of it.
+            locked_coinbases.append(
+                (height, str(coinbase["receiver"]), float(coinbase["amount"]))
             )
             for address, delta in balance_delta.items():
                 balances[address] = round(balances.get(address, 0.0) + delta, 8)
@@ -602,7 +713,7 @@ class Blockchain:
                 sender = tx["sender"]
                 receiver = tx["receiver"]
                 if sender not in temp_balances:
-                    temp_balances[sender] = self.get_balance(sender)
+                    temp_balances[sender] = self.spendable_balance(sender)
                 if receiver not in temp_balances:
                     temp_balances[receiver] = self.get_balance(receiver)
                 required = round(float(tx["amount"]) + float(tx["fee"]), 8)
@@ -616,13 +727,13 @@ class Blockchain:
         return selected
 
     def create_candidate_block(self, miner_address: str, transfers: list[dict[str, Any]]) -> dict[str, Any]:
+        next_height = self.height() + 1
         fees = round(sum(float(tx["fee"]) for tx in transfers), 8)
         coinbase = create_coinbase(
             miner_address,
-            round(self.mining_reward + fees, 8),
-            height=self.height() + 1,
+            round(self.block_subsidy(next_height) + fees, 8),
+            height=next_height,
         )
-        next_height = self.height() + 1
         target = self.expected_target(next_height)
         return create_block(
             prev_hash=self.tip_hash(),

@@ -64,6 +64,10 @@ class P2PNode:
         self._tasks: set[asyncio.Task[Any]] = set()
         self.identity = network_identity(config)
 
+    @property
+    def connect_timeout_seconds(self) -> float:
+        return max(float(self.config.get("peer_connect_timeout_seconds", 5)), 0.5)
+
     def _is_self(self, ip: str, port: int) -> bool:
         own_port = int(self.config["listen_port"])
         host = normalize_host(ip)
@@ -195,19 +199,55 @@ class P2PNode:
             if not self._is_self(str(host), int(port)):
                 await self.connect_peer(str(host), int(port))
 
+    async def disconnect_peer(self, ip: str, port: int) -> bool:
+        """Drop a live connection, by listen address or by socket address."""
+        host = normalize_host(ip)
+        dropped = False
+        for key, conn in list(self.connections.items()):
+            matches = conn.ip == host and int(port) in {
+                int(conn.port),
+                int(conn.listen_port or conn.port),
+            }
+            if not matches:
+                continue
+            self.connections.pop(key, None)
+            conn.writer.close()
+            dropped = True
+        return dropped
+
     async def connect_peer(self, ip: str, port: int) -> tuple[bool, str]:
         ip = normalize_host(ip)
         if self._is_self(ip, port):
             return False, "ignored self peer"
+        if self.service.store.is_peer_banned(ip, int(port)):
+            return False, "peer is banned on this node"
         key = format_host_port(ip, port)
         if key in self.connections:
             return False, "peer already connected"
         try:
-            reader, writer = await asyncio.open_connection(
+            # Without a deadline a mistyped LAN address parks the request until
+            # the OS gives up on the SYN -- around two minutes on Linux -- and
+            # the browser's "connect node" button just spins the whole time.
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, int(port), limit=STREAM_LIMIT_BYTES),
+                timeout=self.connect_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            message = (
+                f"no response from {format_host_port(ip, int(port))} within "
+                f"{self.connect_timeout_seconds}s"
+            )
+            self.service.store.upsert_peer(
                 ip,
                 int(port),
-                limit=STREAM_LIMIT_BYTES,
+                None,
+                None,
+                "outbound",
+                PeerStatus.OFFLINE,
+                int(time.time()),
+                mismatch_reason=message,
             )
+            return False, message
         except OSError as exc:
             self.service.store.upsert_peer(
                 ip,
@@ -228,7 +268,19 @@ class P2PNode:
         peer_info = writer.get_extra_info("peername")
         ip = normalize_host(peer_info[0]) if peer_info else "unknown"
         port = int(peer_info[1]) if peer_info else 0
+        if self._is_banned_host(ip):
+            self.log(f"Refused inbound connection from banned host {ip}")
+            writer.close()
+            return
         await self._connection_loop(reader, writer, ip, port, "inbound")
+
+    def _is_banned_host(self, ip: str) -> bool:
+        """Inbound sockets use an ephemeral port, so ban by host address."""
+        host = normalize_host(ip)
+        return any(
+            normalize_host(str(entry["ip"])) == host
+            for entry in self.service.store.list_banned_peers()
+        )
 
     async def _connection_loop(
         self,
@@ -616,7 +668,9 @@ class P2PNode:
             port = int(peer.get("port") or 0)
             if not ip or not port or self._is_self(ip, port):
                 continue
-            if str(peer.get("status")) == PeerStatus.PARAM_MISMATCH:
+            if str(peer.get("status")) in {PeerStatus.PARAM_MISMATCH, PeerStatus.BANNED}:
+                continue
+            if self.service.store.is_peer_banned(ip, port):
                 continue
             if format_host_port(ip, port) in self.connections:
                 continue

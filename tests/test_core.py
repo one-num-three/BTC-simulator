@@ -24,6 +24,11 @@ from app.storage.sqlite_store import SQLiteStore
 def make_stack(tmp_path: Path):
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["difficulty"] = 1
+    # These tests predate coinbase maturity and the halving schedule, and none
+    # of them is about either rule -- they mine one block and spend it right
+    # away. The two rules are covered on their own in tests/test_economics.py.
+    config["coinbase_maturity"] = 0
+    config["halving_interval"] = 10**6
     config["storage"]["path"] = str(tmp_path / "chain.db")
     store = SQLiteStore(config["storage"]["path"])
     chain = Blockchain(config, store)

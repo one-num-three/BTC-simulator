@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 from app.config import (
@@ -15,9 +17,10 @@ from app.config import (
 from app.core.block import target_preview
 from app.core.blockchain import Blockchain
 from app.core.mempool import Mempool
+from app.core.merkle import merkle_proof, proof_steps, verify_merkle_proof
 from app.core.miner import Miner
-from app.core.transaction import create_transfer
-from app.core.wallet import generate_wallet
+from app.core.transaction import create_transfer, estimate_transaction_bytes
+from app.core.wallet import generate_wallet, wallet_from_private_key
 from app.network.address import (
     configured_listen_hosts,
     format_host_port,
@@ -29,6 +32,98 @@ from app.network.address import (
 from app.network.node import P2PNode
 from app.status import PeerStatus
 from app.storage.sqlite_store import SQLiteStore
+
+
+DEFAULT_LAB_TASKS: list[dict[str, Any]] = [
+    {
+        "id": "wallet",
+        "title": "拿到自己的钱包地址",
+        "detail": "在“接收”页复制地址，这串公钥就是你在这条链上的身份。",
+        "check": "has_wallet",
+    },
+    {
+        "id": "peers",
+        "title": "连上至少一个同学的节点",
+        "detail": "在“节点”页填对方的 IP 和 P2P 端口，或用“入网”页的地址。",
+        "check": "has_peer",
+    },
+    {
+        "id": "mining",
+        "title": "开始挖矿并挖到第一个区块",
+        "detail": "观察 nonce 怎么一个个试，以及 hash 什么时候小于目标值。",
+        "check": "has_block",
+    },
+    {
+        "id": "balance",
+        "title": "拿到第一笔挖矿奖励",
+        "detail": "注意奖励要等成熟期过去才能花，这就是重组保护。",
+        "check": "has_balance",
+    },
+    {
+        "id": "mempool",
+        "title": "发一笔交易并在内存池里看到它",
+        "detail": "交易先进内存池，被打包进区块才算确认。",
+        "check": "has_tx",
+    },
+    {
+        "id": "sync",
+        "title": "和同学的链保持同一个高度",
+        "detail": "如果分叉了，观察累计工作量更大的那条链怎么赢。",
+        "check": "in_sync",
+    },
+]
+
+_LAB_CHECKS = {
+    "has_wallet": lambda s: True,
+    "has_peer": lambda s: s["peers"] > 0,
+    "has_block": lambda s: s["height"] > 0,
+    "has_balance": lambda s: s["balance"] > 0,
+    "has_tx": lambda s: s["mempool"] > 0 or s["tx_count"] > 0,
+    "in_sync": lambda s: s["height"] > 0 and s["peers"] > 0,
+}
+
+
+def _load_lab_tasks(config: dict[str, Any]) -> list[dict[str, Any]]:
+    path = Path(config.get("_config_dir", ".")) / "lab_tasks.json"
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list) and data:
+                return [dict(item) for item in data]
+        except (json.JSONDecodeError, OSError, TypeError):
+            pass
+    return [dict(task) for task in DEFAULT_LAB_TASKS]
+
+
+def _direction(record: dict[str, Any], address: str) -> str:
+    if record.get("type") == "coinbase":
+        return "mined"
+    if record.get("sender") == address:
+        return "out"
+    if record.get("receiver") == address:
+        return "in"
+    return "other"
+
+
+def _fee_buckets(transactions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group pending transactions by fee rate so congestion is visible."""
+    buckets = [
+        {"label": "0", "min": 0.0, "count": 0, "bytes": 0},
+        {"label": "0-0.01", "min": 1e-12, "count": 0, "bytes": 0},
+        {"label": "0.01-0.1", "min": 0.01, "count": 0, "bytes": 0},
+        {"label": "0.1-1", "min": 0.1, "count": 0, "bytes": 0},
+        {"label": "1+", "min": 1.0, "count": 0, "bytes": 0},
+    ]
+    for tx in transactions:
+        fee = float(tx.get("fee", 0.0))
+        size = estimate_transaction_bytes(tx)
+        chosen = buckets[0]
+        for bucket in buckets:
+            if fee >= bucket["min"]:
+                chosen = bucket
+        chosen["count"] += 1
+        chosen["bytes"] += size
+    return buckets
 
 
 class EventLog:
@@ -192,6 +287,299 @@ class NodeService:
         self.store.save_wallet(wallet, make_default=True)
         self.log(f"Wallet generated: {wallet.address[:16]}")
         return self.default_wallet()
+
+    # ------------------------------------------------------------------
+    # wallets
+    #
+    # There used to be exactly one usable wallet: generating a new one made the
+    # old key unreachable from the console even though its coins were still on
+    # chain, and there was no way to back a key up or move it to another node.
+    # ------------------------------------------------------------------
+
+    def _wallet_view(self, wallet: dict[str, Any]) -> dict[str, Any]:
+        address = wallet["address"]
+        return {
+            "name": wallet["name"],
+            "address": address,
+            "public_key": wallet["public_key"],
+            "created_at": wallet["created_at"],
+            "is_default": bool(wallet["is_default"]),
+            "balance": self.blockchain.get_balance(address),
+            "spendable": self.blockchain.spendable_balance(address),
+            "immature": self.blockchain.immature_balance(address),
+            "available": self.blockchain.get_available_balance(address),
+        }
+
+    def list_wallets(self) -> list[dict[str, Any]]:
+        return [self._wallet_view(wallet) for wallet in self.store.list_wallets()]
+
+    def select_wallet(self, address: str) -> dict[str, Any]:
+        if not self.store.set_default_wallet(address):
+            raise ValueError("wallet not found on this node")
+        self.log(f"Active wallet switched to {address[:16]}")
+        return self._wallet_view(self.default_wallet())
+
+    def import_wallet(
+        self, private_key: str, name: str = "imported", make_default: bool = True
+    ) -> dict[str, Any]:
+        wallet = wallet_from_private_key(private_key, name)
+        if self.store.get_wallet(wallet.address):
+            if make_default:
+                self.store.set_default_wallet(wallet.address)
+            self.log(f"Wallet already present: {wallet.address[:16]}")
+            return self._wallet_view(self.store.get_wallet(wallet.address) or {})
+        self.store.save_wallet(wallet, make_default=make_default)
+        self.log(f"Wallet imported: {wallet.address[:16]}")
+        return self._wallet_view(self.store.get_wallet(wallet.address) or {})
+
+    def export_wallet(self, address: str | None = None) -> dict[str, Any]:
+        wallet = self.store.get_wallet(address) if address else self.default_wallet()
+        if not wallet:
+            raise ValueError("wallet not found on this node")
+        return {
+            "name": wallet["name"],
+            "address": wallet["address"],
+            "public_key": wallet["public_key"],
+            "private_key": wallet["private_key"],
+            "created_at": wallet["created_at"],
+            "warning": (
+                "This key is stored and exported in plain text. It exists to "
+                "teach how key ownership works and must never hold real value."
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # transaction lookup and search
+    # ------------------------------------------------------------------
+
+    def transaction_history(
+        self,
+        address: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        limit = min(max(int(limit), 1), 200)
+        offset = max(int(offset), 0)
+        wallet_address = self.default_wallet()["address"]
+        target = address or wallet_address
+        confirmed = self.store.list_transactions(target, limit=limit, offset=offset)
+        pending = self.store.list_pending_transactions(target) if offset == 0 else []
+        height = self.blockchain.height()
+        for record in confirmed:
+            block_height = record.get("block_height")
+            record["confirmations"] = (
+                height - int(block_height) + 1 if block_height is not None else 0
+            )
+            record["direction"] = _direction(record, target)
+        for record in pending:
+            record["confirmations"] = 0
+            record["direction"] = _direction(record, target)
+        return {
+            "address": target,
+            "is_own_wallet": target == wallet_address,
+            "pending": pending,
+            "transactions": confirmed,
+            "total": self.store.count_transactions(target),
+            "limit": limit,
+            "offset": offset,
+            "summary": self.store.address_summary(target),
+        }
+
+    def transaction_detail(self, tx_id: str) -> dict[str, Any] | None:
+        record = self.store.get_transaction(tx_id) or self.store.get_mempool_transaction(tx_id)
+        if record is None:
+            return None
+        block_height = record.get("block_height")
+        record["confirmations"] = (
+            self.blockchain.height() - int(block_height) + 1 if block_height is not None else 0
+        )
+        record["proof"] = self.merkle_proof(tx_id)
+        return record
+
+    def merkle_proof(self, tx_id: str) -> dict[str, Any] | None:
+        """Everything a light client needs to be convinced this tx is in a block."""
+        record = self.store.get_transaction(tx_id)
+        if record is None or not record.get("block_hash"):
+            return None
+        block = self.store.get_block_json_by_hash(str(record["block_hash"]))
+        if not block:
+            return None
+        tx_ids = [tx["tx_id"] for tx in block.get("transactions", [])]
+        if tx_id not in tx_ids:
+            return None
+        index = tx_ids.index(tx_id)
+        proof = merkle_proof(tx_ids, index)
+        root = block["header"]["merkle_root"]
+        return {
+            "tx_id": tx_id,
+            "block_hash": record["block_hash"],
+            "block_height": record.get("block_height"),
+            "index": index,
+            "tx_count": len(tx_ids),
+            "merkle_root": root,
+            "proof": proof,
+            "steps": proof_steps(tx_id, proof),
+            "verified": verify_merkle_proof(tx_id, proof, root),
+            "hashes_needed": len(proof),
+            "hashes_avoided": max(len(tx_ids) - len(proof), 0),
+        }
+
+    def search(self, query: str) -> dict[str, Any]:
+        """One box that finds a block, a transaction or an address.
+
+        The explorer previously accepted only a block height or a block hash,
+        so there was no way to look up a transaction you had just sent.
+        """
+        term = str(query or "").strip()
+        if not term:
+            return {"query": term, "kind": "empty", "results": []}
+
+        if term.isdigit():
+            block = self.store.get_block_detail(int(term))
+            if block:
+                return {"query": term, "kind": "block", "block": block}
+
+        tx = self.store.get_transaction(term) or self.store.get_mempool_transaction(term)
+        if tx:
+            return {"query": term, "kind": "transaction", "transaction": tx}
+
+        block = self.store.get_block_detail(term)
+        if block:
+            return {"query": term, "kind": "block", "block": block}
+
+        summary = self.store.address_summary(term)
+        if summary["received_count"] or summary["sent_count"]:
+            return {
+                "query": term,
+                "kind": "address",
+                "address": summary,
+                "transactions": self.store.list_transactions(term, limit=25),
+            }
+
+        matches = self.store.find_addresses(term, limit=10)
+        if matches:
+            return {"query": term, "kind": "suggestions", "addresses": matches}
+        return {"query": term, "kind": "not_found", "results": []}
+
+    # ------------------------------------------------------------------
+    # chart data
+    # ------------------------------------------------------------------
+
+    def chart_stats(self, window: int = 100) -> dict[str, Any]:
+        window = min(max(int(window), 2), 500)
+        blocks = self.store.block_series(limit=window)
+        points: list[dict[str, Any]] = []
+        intervals: list[int] = []
+        cumulative = 0.0
+        for index, row in enumerate(blocks):
+            interval = None
+            # Genesis carries timestamp 0, so the gap between it and block 1 is
+            # "seconds since 1970" and would swamp every average it touches.
+            if index > 0 and int(blocks[index - 1]["height"]) > 0:
+                interval = max(int(row["timestamp"]) - int(blocks[index - 1]["timestamp"]), 0)
+                intervals.append(interval)
+            difficulty = int(row["difficulty"])
+            cumulative = round(cumulative + float(row["coinbase_amount"]), 8)
+            points.append(
+                {
+                    "height": int(row["height"]),
+                    "timestamp": int(row["timestamp"]),
+                    "difficulty": difficulty,
+                    "interval": interval,
+                    "tx_count": int(row["tx_count"]),
+                    "fees": round(float(row["fees"]), 8),
+                    "subsidy": round(float(row["coinbase_amount"]) - float(row["fees"]), 8),
+                    "issued": cumulative,
+                    # Estimated hashes spent on this block: 2^difficulty attempts
+                    # on average, spread over the observed interval.
+                    "hashrate": (
+                        round((2**difficulty) / interval, 2)
+                        if interval and interval > 0
+                        else None
+                    ),
+                }
+            )
+        average_interval = round(sum(intervals) / len(intervals), 2) if intervals else None
+        mempool = self.mempool.ordered()
+        return {
+            "window": window,
+            "blocks": points,
+            "average_interval": average_interval,
+            "target_block_seconds": self.blockchain.target_block_seconds,
+            "estimated_hashrate": (
+                round((2 ** self.blockchain.expected_difficulty()) / average_interval, 2)
+                if average_interval and average_interval > 0
+                else None
+            ),
+            "supply": self.blockchain.supply_policy(),
+            "mempool_fee_buckets": _fee_buckets(mempool),
+        }
+
+    # ------------------------------------------------------------------
+    # peer management
+    # ------------------------------------------------------------------
+
+    async def forget_peer(self, ip: str, port: int) -> dict[str, Any]:
+        host = normalize_host(ip)
+        await self.p2p.disconnect_peer(host, int(port))
+        self.store.delete_peer(host, int(port))
+        self.log(f"Peer removed: {format_host_port(host, int(port))}")
+        return {"removed": True, "ip": host, "port": int(port)}
+
+    async def ban_peer(self, ip: str, port: int) -> dict[str, Any]:
+        host = normalize_host(ip)
+        self.store.ban_peer(host, int(port), "banned from the console", int(time.time()))
+        await self.p2p.disconnect_peer(host, int(port))
+        self.store.upsert_peer(
+            host,
+            int(port),
+            None,
+            None,
+            "outbound",
+            PeerStatus.BANNED,
+            int(time.time()),
+        )
+        self.log(f"Peer banned: {format_host_port(host, int(port))}")
+        return {"banned": True, "ip": host, "port": int(port)}
+
+    def unban_peer(self, ip: str, port: int) -> dict[str, Any]:
+        host = normalize_host(ip)
+        self.store.unban_peer(host, int(port))
+        self.log(f"Peer unbanned: {format_host_port(host, int(port))}")
+        return {"banned": False, "ip": host, "port": int(port)}
+
+    # ------------------------------------------------------------------
+    # classroom lab sheet
+    # ------------------------------------------------------------------
+
+    def lab_tasks(self) -> dict[str, Any]:
+        """Progress on the lab checklist, evaluated on the server.
+
+        The task list used to be hardcoded in the browser, so a teacher could
+        not change it without editing JavaScript. It now comes from
+        ``lab_tasks.json`` next to the config file when that file exists.
+        """
+        status = self.status_summary()
+        tasks = _load_lab_tasks(self.config)
+        for task in tasks:
+            key = str(task.get("check") or "")
+            task["done"] = bool(_LAB_CHECKS.get(key, lambda _s: False)(status))
+        return {
+            "tasks": tasks,
+            "completed": sum(1 for task in tasks if task["done"]),
+            "total": len(tasks),
+        }
+
+    def status_summary(self) -> dict[str, Any]:
+        wallet = self.default_wallet()
+        return {
+            "height": self.blockchain.height(),
+            "balance": self.blockchain.get_balance(wallet["address"]),
+            "peers": self.p2p.connection_counts()["total"],
+            "mempool": self.mempool.stats()["count"],
+            "is_mining": self.miner.is_mining,
+            "tx_count": self.store.count_transactions(wallet["address"]),
+        }
 
     async def create_transaction(
         self,
@@ -422,6 +810,9 @@ class NodeService:
             "target": target,
             "target_preview": target_preview(target),
             "difficulty_policy": self.blockchain.difficulty_policy(),
+            "supply": self.blockchain.supply_policy(),
+            "immature_balance": self.blockchain.immature_balance(wallet["address"]),
+            "spendable_balance": self.blockchain.spendable_balance(wallet["address"]),
             "network": self.network_info(),
             "mining": {
                 "status": self.miner.status,

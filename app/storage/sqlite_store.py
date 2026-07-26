@@ -103,6 +103,14 @@ class SQLiteStore:
                     mismatch_reason TEXT,
                     PRIMARY KEY (ip, port)
                 );
+
+                CREATE TABLE IF NOT EXISTS banned_peers (
+                    ip TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    reason TEXT,
+                    banned_at INTEGER NOT NULL,
+                    PRIMARY KEY (ip, port)
+                );
                 """
             )
             self._ensure_columns(
@@ -203,6 +211,38 @@ class SQLiteStore:
                 """
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def get_wallet(self, address: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT name, address, public_key, private_key_plain_for_mvp AS private_key,
+                       created_at, is_default
+                FROM wallet_keys
+                WHERE address = ?
+                """,
+                (str(address),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def set_default_wallet(self, address: str) -> bool:
+        """Switch which key the node signs and mines with.
+
+        Generating a wallet used to silently replace the default and the old
+        one became unreachable from the console even though its balance was
+        still on chain.
+        """
+        with self.lock, self.conn:
+            existing = self.conn.execute(
+                "SELECT 1 FROM wallet_keys WHERE address = ? LIMIT 1", (str(address),)
+            ).fetchone()
+            if existing is None:
+                return False
+            self.conn.execute("UPDATE wallet_keys SET is_default = 0")
+            self.conn.execute(
+                "UPDATE wallet_keys SET is_default = 1 WHERE address = ?", (str(address),)
+            )
+            return True
 
     def insert_block(self, height: int, block_hash: str, block: dict[str, Any]) -> None:
         header = block["header"]
@@ -426,6 +466,210 @@ class SQLiteStore:
             ).fetchone()["value"]
             return round(float(income) - float(spend), 8)
 
+    # ------------------------------------------------------------------
+    # transaction lookup
+    #
+    # The console could previously only search by block height or block hash,
+    # so a student who had just sent a transaction had no way to find it again.
+    # ------------------------------------------------------------------
+
+    def get_transaction(self, tx_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT t.tx_id, t.block_hash, t.type, t.sender, t.receiver,
+                       t.amount, t.fee, t.timestamp, t.tx_json,
+                       b.height AS block_height, b.timestamp AS block_time
+                FROM transactions t
+                LEFT JOIN blocks b ON b.hash = t.block_hash
+                WHERE t.tx_id = ?
+                """,
+                (str(tx_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        record["tx"] = json.loads(record.pop("tx_json"))
+        record["state"] = "confirmed"
+        return record
+
+    def get_mempool_transaction(self, tx_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT tx_json, received_at FROM mempool WHERE tx_id = ?",
+                (str(tx_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        tx = json.loads(row["tx_json"])
+        return {
+            "tx_id": tx["tx_id"],
+            "block_hash": None,
+            "block_height": None,
+            "block_time": None,
+            "type": tx.get("type"),
+            "sender": tx.get("sender"),
+            "receiver": tx.get("receiver"),
+            "amount": float(tx.get("amount", 0.0)),
+            "fee": float(tx.get("fee", 0.0)),
+            "timestamp": int(tx.get("timestamp", 0)),
+            "received_at": int(row["received_at"]),
+            "tx": tx,
+            "state": "pending",
+        }
+
+    def list_transactions(
+        self,
+        address: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        clause = ""
+        params: list[Any] = []
+        if address:
+            clause = "WHERE t.sender = ? OR t.receiver = ?"
+            params = [address, address]
+        params.extend([int(limit), int(offset)])
+        with self.lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT t.tx_id, t.block_hash, t.type, t.sender, t.receiver,
+                       t.amount, t.fee, t.timestamp,
+                       b.height AS block_height, b.timestamp AS block_time
+                FROM transactions t
+                LEFT JOIN blocks b ON b.hash = t.block_hash
+                {clause}
+                ORDER BY b.height DESC, t.rowid DESC
+                LIMIT ? OFFSET ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [{**dict(row), "state": "confirmed"} for row in rows]
+
+    def count_transactions(self, address: str | None = None) -> int:
+        sql = "SELECT COUNT(*) AS value FROM transactions"
+        params: tuple[Any, ...] = ()
+        if address:
+            sql += " WHERE sender = ? OR receiver = ?"
+            params = (address, address)
+        with self.lock:
+            return int(self.conn.execute(sql, params).fetchone()["value"])
+
+    def list_pending_transactions(self, address: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT tx_json, received_at FROM mempool"
+        params: tuple[Any, ...] = ()
+        if address:
+            sql += " WHERE sender = ? OR receiver = ?"
+            params = (address, address)
+        sql += " ORDER BY fee DESC, timestamp ASC"
+        with self.lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        results = []
+        for row in rows:
+            tx = json.loads(row["tx_json"])
+            results.append(
+                {
+                    "tx_id": tx["tx_id"],
+                    "block_hash": None,
+                    "block_height": None,
+                    "block_time": None,
+                    "type": tx.get("type"),
+                    "sender": tx.get("sender"),
+                    "receiver": tx.get("receiver"),
+                    "amount": float(tx.get("amount", 0.0)),
+                    "fee": float(tx.get("fee", 0.0)),
+                    "timestamp": int(tx.get("timestamp", 0)),
+                    "received_at": int(row["received_at"]),
+                    "state": "pending",
+                }
+            )
+        return results
+
+    def find_addresses(self, prefix: str, limit: int = 10) -> list[str]:
+        pattern = f"{prefix}%"
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT DISTINCT address FROM (
+                    SELECT sender AS address FROM transactions WHERE sender LIKE ?
+                    UNION
+                    SELECT receiver AS address FROM transactions WHERE receiver LIKE ?
+                )
+                WHERE address IS NOT NULL
+                LIMIT ?
+                """,
+                (pattern, pattern, int(limit)),
+            ).fetchall()
+        return [str(row["address"]) for row in rows]
+
+    def address_summary(self, address: str) -> dict[str, Any]:
+        with self.lock:
+            received = self.conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) AS value, COUNT(*) AS count "
+                "FROM transactions WHERE receiver = ?",
+                (address,),
+            ).fetchone()
+            sent = self.conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) AS value, "
+                "COALESCE(SUM(fee), 0) AS fees, COUNT(*) AS count "
+                "FROM transactions WHERE sender = ?",
+                (address,),
+            ).fetchone()
+        return {
+            "address": address,
+            "received": round(float(received["value"]), 8),
+            "received_count": int(received["count"]),
+            "sent": round(float(sent["value"]), 8),
+            "fees_paid": round(float(sent["fees"]), 8),
+            "sent_count": int(sent["count"]),
+        }
+
+    # ------------------------------------------------------------------
+    # chart data
+    # ------------------------------------------------------------------
+
+    def block_series(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Recent blocks with the fields the charts need, oldest first."""
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT b.height, b.timestamp, b.difficulty, b.target, b.hash,
+                       COUNT(t.tx_id) AS tx_count,
+                       COALESCE(SUM(CASE WHEN t.type = 'coinbase' THEN t.amount ELSE 0 END), 0)
+                           AS coinbase_amount,
+                       COALESCE(SUM(CASE WHEN t.type != 'coinbase' THEN t.fee ELSE 0 END), 0)
+                           AS fees
+                FROM blocks b
+                LEFT JOIN transactions t ON t.block_hash = b.hash
+                GROUP BY b.height
+                ORDER BY b.height DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def total_issued(self) -> float:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) AS value FROM transactions WHERE type = 'coinbase'"
+            ).fetchone()
+        return round(float(row["value"]), 8)
+
+    def immature_coinbase_total(self, address: str, mature_below_height: int) -> float:
+        """Coinbase paid to ``address`` in blocks newer than the maturity depth."""
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT COALESCE(SUM(t.amount), 0) AS value
+                FROM transactions t
+                JOIN blocks b ON b.hash = t.block_hash
+                WHERE t.type = 'coinbase' AND t.receiver = ? AND b.height > ?
+                """,
+                (address, int(mature_below_height)),
+            ).fetchone()
+        return round(float(row["value"]), 8)
+
     def add_mempool_transaction(self, tx: dict[str, Any], received_at: int) -> None:
         with self.lock, self.conn:
             self.conn.execute(
@@ -572,3 +816,45 @@ class SQLiteStore:
                 "DELETE FROM peers WHERE ip = ? AND port = ?",
                 (ip, int(port)),
             )
+
+    # ------------------------------------------------------------------
+    # peer bans
+    #
+    # The security page used to only *report* misbehaving nodes. A teacher
+    # could see which student was flooding invalid blocks and had no way to
+    # make it stop.
+    # ------------------------------------------------------------------
+
+    def ban_peer(self, ip: str, port: int, reason: str | None, banned_at: int) -> None:
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO banned_peers (ip, port, reason, banned_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(ip, port) DO UPDATE SET
+                    reason = excluded.reason,
+                    banned_at = excluded.banned_at
+                """,
+                (ip, int(port), reason, int(banned_at)),
+            )
+
+    def unban_peer(self, ip: str, port: int) -> None:
+        with self.lock, self.conn:
+            self.conn.execute(
+                "DELETE FROM banned_peers WHERE ip = ? AND port = ?", (ip, int(port))
+            )
+
+    def is_peer_banned(self, ip: str, port: int) -> bool:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM banned_peers WHERE ip = ? AND port = ? LIMIT 1",
+                (ip, int(port)),
+            ).fetchone()
+        return row is not None
+
+    def list_banned_peers(self) -> list[dict[str, Any]]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT ip, port, reason, banned_at FROM banned_peers ORDER BY ip, port"
+            ).fetchall()
+        return [dict(row) for row in rows]

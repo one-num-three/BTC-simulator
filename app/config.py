@@ -32,9 +32,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "min_difficulty": 0,
     "max_difficulty": 255,
     "mining_reward": 50.0,
+    # Bitcoin halves every 210,000 blocks (~4 years). A classroom needs to see
+    # several halvings inside one lesson, so the default window is tiny. The
+    # supply cap follows from it: sum(interval * reward / 2**era) until the
+    # subsidy rounds to zero.
+    "halving_interval": 20,
+    # Blocks a coinbase output must be buried under before it can be spent.
+    # Real Bitcoin uses 100; the point is that mining income is not instantly
+    # spendable, because a reorg can undo it.
+    "coinbase_maturity": 5,
     "max_block_transactions": 100,
     "mempool_max_bytes": 314572800,
+    "mempool_expiry_seconds": 3600,
+    "min_relay_fee": 0.0,
     "sync_interval_seconds": 10,
+    "peer_connect_timeout_seconds": 5,
+    "trust_loopback_admin": True,
+    "require_admin_for_writes": True,
     "servers": [
         ["127.0.0.1", 7464],
         ["127.0.0.1", 7465],
@@ -56,6 +70,8 @@ CONSENSUS_PARAM_KEYS = (
     "min_difficulty",
     "max_difficulty",
     "mining_reward",
+    "halving_interval",
+    "coinbase_maturity",
     "max_block_transactions",
 )
 
